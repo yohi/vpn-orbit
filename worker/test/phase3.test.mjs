@@ -1,0 +1,123 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {fileURLToPath} from 'node:url';
+import {convertOvpn,parseCatalog,selectGroup,buildConfig,isPublicIPv4,parseCsvLine} from '../src/catalog.mjs';
+import {refreshProfile,handleRequest} from '../src/index.mjs';
+const fixture = (name)=>readFileSync(new URL(`./fixtures/${name}`,import.meta.url),'utf8');
+const cert = fixture('a.pem');
+const cert2 = fixture('b.pem');
+const ipA = '8.8.8.8', ipB = '9.9.9.9', ipC = '1.1.1.1';
+function ovpn(ip,{ca=cert,script='',control='',auth=''}={}) {
+  return `client\nproto udp\nremote ${ip} 1195\ncipher AES-128-CBC\nauth SHA1\nremote-cert-tls server\n${auth}\n<ca>\n${ca}</ca>\n${control}\n${script}`;
+}
+const encoded = text => Buffer.from(text).toString('base64');
+const row = (ip,p=ovpn(ip),country='JP',ping=10)=>`test.opengw.net,${ip},100,${ping},25000000,${country},${encoded(p)}`;
+const csv = (...rows)=> '*vpn_servers\n#HostName,IP,Score,Ping,Speed,CountryShort,OpenVPN_ConfigData_Base64\n'+rows.join('\n');
+function env(approved='8.8.8.8,9.9.9.9') {
+  const values=new Map(); const writes=[];
+  return {APPROVED_IPS:approved,MAX_SERVERS:'5',PROFILE_KV:{
+    get:async key=>values.get(key)||null,
+    put:async (key,value)=>{writes.push(value);values.set(key,value);}
+  }, values,writes};
+}
+const fakeFetch=(contents,status=200)=>async (_url,options)=>new Response(contents,{status,headers:{'content-type':'text/plain'}});
+const t0=1_800_000_000_000;
+
+test('public IPv4 validation rejects private, reserved, and suspicious notation',()=>{
+  for(const val of ['192.168.0.1','10.1.2.3','127.0.0.1','169.254.2.3','100.64.0.1','203.0.113.1','198.51.100.10','1.01.1.1','1.1.1.999']) assert.equal(isPublicIPv4(val),false,val);
+  assert.equal(isPublicIPv4(ipA),true);
+});
+test('CSV quoted field parsing',()=>assert.deepEqual(parseCsvLine('"foo,bar",qux,"a""b"'),['foo,bar','qux','a"b']));
+test('OpenVPN profile generates independently verified CA and no unsafe directives',()=>{
+  const e=convertOvpn(ovpn(ipA),ipA);
+  assert.equal(e.server,ipA);assert.equal(e.tls.remote_certificate_tls,'server');
+  assert.equal(e.block_ipv6,true);
+  assert.ok(e.tls.certificate[0].includes('BEGIN CERTIFICATE'));
+  assert.equal(buildConfig(e).route.final,'vpn-gate');
+});
+test('incompatible/tricky OpenVPN profiles fail closed',()=>{
+  const bad=[
+    ovpn(ipA,{script:'up /tmp/evil.sh'}),
+    ovpn(ipA,{script:'script-security 3'}),
+    ovpn(ipA,{script:'<script>\nevil\n</script>'}),
+    ovpn(ipA,{auth:'auth-user-pass /tmp/password'}),
+    ovpn(ipA).replace('remote-cert-tls server','remote-cert-tls none'),
+    ovpn(ipA).replace('remote 8.8.8.8','remote 1.1.1.1'),
+    ovpn(ipA).replace(/<ca>[\s\S]*?<\/ca>/,'<ca>\nnot a cert\n</ca>'),
+    ovpn(ipA,{script:'remote 8.8.8.8 9999'}),
+    ovpn(ipA,{script:'key-direction 1'}),
+  ];
+  bad.forEach((value,i)=>assert.throws(()=>convertOvpn(value,ipA),`bad profile ${i}`));
+});
+test('client credentials are fixed to public VPN Gate defaults; no external filename',()=>{
+  const e=convertOvpn(ovpn(ipA,{auth:'auth-user-pass'}),ipA);
+  assert.equal(e.username,'vpn');assert.equal(e.password,'vpn');
+});
+test('approved JP-only candidates are selected by ping then only exact TLS groups',()=>{
+  const data=csv(row(ipA,ovpn(ipA), 'JP',8),row(ipB,ovpn(ipB),'JP',9),row(ipC,ovpn(ipC),'JP',2));
+  const opts=parseCatalog(data,new Set([ipA,ipB]));
+  assert.deepEqual(opts.map(c=>c.ip),[ipA,ipB]);
+  const {endpoint,selected}=selectGroup(opts);
+  assert.deepEqual(selected,[ipA,ipB]);assert.deepEqual(endpoint.servers.map(x=>x.server),[ipA,ipB]);
+  assert.equal(endpoint.server,undefined);assert.equal(endpoint.block_ipv6,true);
+});
+test('different CA certificates are never unioned',()=>{
+  const candidates=parseCatalog(csv(row(ipA),row(ipB,ovpn(ipB,{ca:cert2}))),new Set([ipA,ipB]));
+  assert.equal(candidates.length,2);
+  assert.throws(()=>selectGroup(candidates),/fewer than two/);
+});
+test('invalid country/mismatched IP/unsafe script omitted',()=>{
+  const opts=parseCatalog(csv(row(ipA),row(ipB,ovpn(ipA)),row(ipC,ovpn(ipC),'KR')),
+    new Set([ipA,ipB,ipC]));
+  assert.deepEqual(opts.map(x=>x.ip),[ipA]);
+});
+test('cron refresh publishes fresh validated config without leaking candidates in health',async()=>{
+  const e=env();
+  const result=await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
+  assert.equal(result.selectedCount,2);
+  assert.equal(e.writes.length,1);
+  const res=await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000);
+  assert.equal(res.status,200);
+  assert.equal(res.headers.get('cache-control'),'no-store');
+  const profile=await res.json();
+  assert.deepEqual(profile.endpoints[0].servers.map(x=>x.server),[ipA,ipB]);
+  const health=await handleRequest(new Request('https://example.com/health'),e,t0+1000);
+  assert.equal(health.status,200);
+  assert.deepEqual(await health.json(),{status:'ready',ageSeconds:1,servers:2});
+});
+test('unapproved or single approved IP cannot trigger publication',async()=>{
+  const e=env(ipA);
+  await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0),/APPROVED_IPS/);
+  assert.equal(e.writes.length,0);
+});
+test('API outage does not erase last valid record, but stale record is not served',async()=>{
+  const e=env();
+  await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
+  await assert.rejects(()=>refreshProfile(e,fakeFetch('unavailable',502),t0+60000));
+  assert.equal(e.writes.length,1);
+  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+120000)).status,200);
+  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+7200001)).status,503);
+});
+test('no KV snapshot = fail-closed (503); no direct fallback; only GET',async()=>{
+  const e=env();
+  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0)).status,503);
+  assert.equal((await handleRequest(new Request('https://example.com/profile.json',{method:'POST'}),e,t0)).status,405);
+  assert.equal((await handleRequest(new Request('https://example.com/admin'),e,t0)).status,404);
+});
+test('malformed KV snapshot never served',async()=>{
+  const e=env();e.values.set('profile-v1','{"bad":true}');
+  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0)).status,503);
+});
+test('less than two compatible approved remotes never replaced last good snapshot',async()=>{
+  const e=env();
+  await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
+  await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(row(ipA))),t0+30000),/fewer than two/);
+  assert.equal(e.writes.length,1);
+});
+test('API redirect to untrusted origin rejected before any KV write',async()=>{
+  const e=env();
+  const evil = async () => ({ok:true,url:'https://evil.example/poison.csv',headers:new Headers(),arrayBuffer:async()=>new TextEncoder().encode(csv(row(ipA),row(ipB))).buffer});
+  await assert.rejects(()=>refreshProfile(e,evil,t0),/unexpected API response/);
+  assert.equal(e.writes.length,0);
+});
