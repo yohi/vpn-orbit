@@ -1,8 +1,8 @@
 # vpn-orbit
 
-VPN GateのOpenVPN接続設定から、iOS/iPadOS向け **sing-box MT 1.14+** の単一接続先プロファイルを生成する **Phase 1 PoC** です。
+VPN GateのOpenVPN接続設定から、iOS/iPadOS向け **sing-box MT 1.14+** のプロファイルを生成するPoCです。Phase 1（単一接続先）に、Phase 2（互換な複数OpenVPN接続先での再接続）を積み上げています。
 
-**現状：変換・候補抽出のローカルテスト段階。iPhone/iPadの実VPN接続成功、東京GeoIP判定、フェイルオーバーは未確認です。** Workersデプロイ、クラウドへの書込み、VPNの自動切替はこのPhaseには含みません。
+**現状：ローカル変換テストの段階です。iPhone/iPadの実VPN接続、東京GeoIP判定、障害時の無操作フェイルオーバーは未確認です。** Workersデプロイ、クラウドへの書込みは含みません。
 
 ## 目的・範囲
 
@@ -42,7 +42,24 @@ python3 -m unittest discover -s tests -v
 - TUN切断時の直接接続復帰、DNS/IPv6漏れを防ぐ「完全なKill Switch」は実証していません。機密通信や位置保証の必要な利用には使わないでください。
 - ローカルVPNはiOSの他のVPN（WARP等）と競合する可能性があります。検証時は併用しないでください。
 
-続きの操作は [docs/phase1-ios.md](docs/phase1-ios.md) を参照。
+### Phase 2：複数接続先（新規）
+
+```bash
+# 2件以上のローカル .ovpn から、TLS設定が互換な接続先だけを選択
+python3 -m vpn_orbit.phase2 \
+  --ovpn /path/a.ovpn /path/b.ovpn \
+  --output /tmp/vpn-orbit-phase2.json
+
+# APIから最大5台の互換なJP接続先を検索
+python3 -m vpn_orbit.phase2 --from-vpngate \
+  --max-servers 5 --output /tmp/vpn-orbit-phase2.json
+```
+
+sing-boxは1つのOpenVPN Client Endpointに`servers`配列を設定でき、接続失敗時の次候補再試行が公式仕様として存在します。ただし**異なるCA等を自動的に安全に切り替える機能ではありません**。原則としてCA・TLS・認証設定が同一の候補のみをまとめます。条件に合わない場合は出力しません。異なるCAを統合する明示的な実験用オプション`--allow-ca-union`も用意しましたが、個別IPへのCAピン留めはできず、信頼対象が広がるため通常利用は非推奨です。
+
+詳細な条件と実機試験は [docs/phase2-ios.md](docs/phase2-ios.md) を参照。単体テストは `python3 -m unittest discover -s tests -v`。Phase 2は**コンバーター実装**であり、iOS実機での自動切替成功ではありません。
+
+Phase 1の実機テストは [docs/phase1-ios.md](docs/phase1-ios.md) を参照。
 
 ## 参照
 
