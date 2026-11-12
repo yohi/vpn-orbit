@@ -34,11 +34,8 @@ export function isPublicIPv4(input) {
       (a === 192 && b === 0 && c === 0) || (a === 192 && b === 0 && c === 2) ||
       (a === 198 && b === 18) || (a === 198 && b === 19) ||
       (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113) ||
-      (a === 192 && b === 88 && c === 99) ||
-      (a === 255)) return false;
-  // Additional special-purpose ranges: 192.0.0/24 and 192.0.0.0/24 have
-  // standards exceptions, but excluding them is safer for public VPN access.
-  if (a === 192 && b === 0 && c === 0) return false;
+      (a === 192 && b === 88 && c === 99)) return false;
+  // 192.0.0.0/24 has standards exceptions, but excluding it is safer for public VPN access.
   return true;
 }
 

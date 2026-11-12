@@ -120,3 +120,19 @@ test('API redirect to untrusted origin rejected before any KV write',async()=>{
   await assert.rejects(()=>refreshProfile(e,evil,t0),/unexpected API response/);
   assert.equal(e.writes.length,0);
 });
+test('catalog stream exceeding the byte limit is cancelled before publication',async()=>{
+  const e=env();
+  let chunks=0;
+  const oversized = new ReadableStream({
+    pull(controller) {
+      if (chunks++ === 0) controller.enqueue(new Uint8Array(16 * 1024 * 1024));
+      else if (chunks === 2) controller.enqueue(new Uint8Array([1]));
+      else controller.close();
+    },
+  },{highWaterMark:0});
+  const fetchOversized = async () => new Response(oversized,{status:200});
+
+  await assert.rejects(()=>refreshProfile(e,fetchOversized,t0),/catalog too large/);
+  assert.equal(chunks,2);
+  assert.equal(e.writes.length,0);
+});

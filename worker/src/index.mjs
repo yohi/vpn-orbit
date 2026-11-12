@@ -22,8 +22,25 @@ export async function refreshProfile(env, fetchFn=fetch, now=Date.now()) {
     const res = await fetchFn(API_URL,{signal:controller.signal,headers:{Accept:'text/plain'}});
     if (!res.ok || new URL(res.url || API_URL).href !== API_URL) throw new Error('unexpected API response or redirect');
     if (Number(res.headers?.get('content-length') || 0) > MAX_CATALOG_BYTES) throw new Error('catalog too large');
-    const bytes = await res.arrayBuffer();
-    if (bytes.byteLength > MAX_CATALOG_BYTES) throw new Error('catalog too large');
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error('catalog response body missing');
+    const chunks = [];
+    let total = 0;
+    try {
+      while (true) {
+        const {done,value} = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > MAX_CATALOG_BYTES) {
+          await reader.cancel();
+          throw new Error('catalog too large');
+        }
+        chunks.push(value);
+      }
+    } finally { reader.releaseLock(); }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk,offset); offset += chunk.byteLength; }
     csv = new TextDecoder('utf-8',{fatal:true}).decode(bytes);
   } finally { clearTimeout(timeout); }
   const candidates = parseCatalog(csv,approved);
@@ -42,7 +59,7 @@ function readSnapshot(raw,now) {
   try {
     const s = JSON.parse(raw);
     if (typeof s.updatedAt !== 'number' || !Number.isFinite(s.updatedAt) ||
-        s.updatedAt > now + 60000 || now - s.updatedAt > MAX_AGE_MS || now < s.updatedAt - 60000 ||
+        s.updatedAt > now + 60000 || now - s.updatedAt > MAX_AGE_MS ||
         typeof s.profile !== 'string' || s.profile.length > MAX_PROFILE_JSON) return null;
     const cfg = JSON.parse(s.profile);
     if (cfg?.endpoints?.length !== 1 || cfg.endpoints[0].type !== 'openvpn-client' ||
