@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
-import io
 import ipaddress
 import json
 import os
