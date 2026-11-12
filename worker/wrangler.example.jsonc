@@ -1,0 +1,15 @@
+{
+  // Copy to worker/wrangler.jsonc after you have explicitly approved deployment.
+  "name": "vpn-orbit",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-11-12",
+  "workers_dev": true,
+  "triggers": {"crons": ["*/30 * * * *"]},
+  "kv_namespaces": [{"binding": "PROFILE_KV", "id": "REPLACE_WITH_REAL_KV_NAMESPACE_ID"}],
+  "vars": {
+    // Comma-separated, user-verified Tokyo-tested ingress (remote) IPs.
+    // Must have at least 2 and be explicitly approved; do not auto-trust JP.
+    "APPROVED_IPS": "REPLACE_WITH_TWO_OR_MORE_VERIFIED_PUBLIC_IPS",
+    "MAX_SERVERS": "5"
+  }
+}

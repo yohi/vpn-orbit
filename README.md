@@ -67,3 +67,9 @@ Phase 1の実機テストは [docs/phase1-ios.md](docs/phase1-ios.md) を参照�
 - https://sing-box.sagernet.org/configuration/endpoint/openvpn-client/
 - https://sing-box.sagernet.org/configuration/inbound/tun/
 - https://sing-box.sagernet.org/configuration/route/
+
+## Phase 3 — Cloudflare Workers / remote profile distribution
+
+Phase 3 builds on Phase 2, adding a Cloudflare Worker that periodically fetches VPN Gate's JP catalog and serves a sing-box MT profile at `GET /profile.json`. It selects only operator-approved Tokyo-tested ingress IPs sharing identical CA and TLS settings, requires at least two distinct remotes, and never emits a direct fallback. An expired profile returns HTTP 503; **this does not revoke a profile already cached on iOS**.
+
+Run Phase 3 unit tests with `cd worker && npm test` (Node.js 20+, no dependencies). See [Phase 3 guide](docs/phase3-workers.md). The deployment config is an intentionally nonfunctional template. **No Cloudflare resources were created or deployed; live VPN connectivity, iOS remote update, automatic failover, Tokyo classification, and kill-switch behavior remain unverified.**

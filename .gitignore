@@ -6,3 +6,8 @@ __pycache__/
 *.json
 !tests/fixtures/*.json
 .profile-output/
+
+# Local Cloudflare account configuration only (never commit)
+worker/wrangler.jsonc
+# Preserve the package manifest despite the generic *.json ignore
+!worker/package.json
