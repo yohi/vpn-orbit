@@ -87,15 +87,31 @@ function validateStaticKey(body) {
   return body.trim() + '\n';
 }
 
+function validateClientKey(body) {
+  const match = body.trim().match(/^-----BEGIN (RSA )?PRIVATE KEY-----\s+([A-Za-z0-9+/=\s]+?)\s+-----END \1PRIVATE KEY-----$/s);
+  if (!match) throw new Error('invalid client identity key');
+  const der = decodeBase64(match[2].replace(/\s+/g, ''));
+  if (der.length < 32 || der[0] !== 0x30) throw new Error('invalid client identity key');
+}
+
 export function convertOvpn(profile, expectedIp) {
   if (typeof profile !== 'string' || new TextEncoder().encode(profile).length > MAX_PROFILE_BYTES) throw new Error('profile too large');
   const blocks = new Map();
-  let rest = profile.replace(/^<(ca|tls-auth|tls-crypt)>\s*\r?\n([\s\S]*?)^<\/\1>\s*$/gm, (_, key, value) => {
+  let rest = profile.replace(/^<(ca|tls-auth|tls-crypt|cert|key)>\s*\r?\n([\s\S]*?)^<\/\1>\s*$/gm, (_, key, value) => {
     if (blocks.has(key)) throw new Error('duplicate inline block');
     blocks.set(key, value);
     return '';
   });
   if (/^\s*<\/?[a-z]/im.test(rest)) throw new Error('unsupported inline block');
+  if (blocks.has('cert') !== blocks.has('key')) throw new Error('client identity certificate and key must be paired');
+  if (blocks.has('cert')) {
+    try {
+      validateCerts(blocks.get('cert'));
+      validateClientKey(blocks.get('key'));
+    } catch {
+      throw new Error('invalid client identity certificate or key');
+    }
+  }
   const directives = new Map();
   for (const raw of rest.split(/\r?\n/)) {
     const line = raw.trim();

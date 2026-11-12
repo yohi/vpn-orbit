@@ -35,6 +35,21 @@ test('OpenVPN profile generates independently verified CA and no unsafe directiv
   assert.ok(e.tls.certificate[0].includes('BEGIN CERTIFICATE'));
   assert.equal(buildConfig(e).route.final,'vpn-gate');
 });
+test('SoftEther dummy client identity blocks are validated and omitted from the endpoint',()=>{
+  const clientCert=cert;
+  const clientKey='-----BEGIN RSA PRIVATE KEY-----\nMCEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\n-----END RSA PRIVATE KEY-----';
+  const profile=ovpn(ipA).replace('</ca>',`</ca>\n<cert>\n${clientCert}</cert>\n<key>\n${clientKey}\n</key>`);
+  const endpoint=convertOvpn(profile,ipA);
+  assert.equal(endpoint.tls.client_certificate,undefined);
+  assert.equal(JSON.stringify(endpoint).includes('RSA PRIVATE KEY'),false);
+  assert.equal(parseCatalog(csv(row(ipA,profile)),new Set([ipA,ipB])).length,1);
+});
+test('client identity blocks must be paired and contain valid PEM encoding',()=>{
+  const certOnly=ovpn(ipA).replace('</ca>',`</ca>\n<cert>\n${cert}</cert>`);
+  const malformed=ovpn(ipA).replace('</ca>',`</ca>\n<cert>\nnot a certificate\n</cert>\n<key>\nnot a key\n</key>`);
+  assert.throws(()=>convertOvpn(certOnly,ipA),/client identity/);
+  assert.throws(()=>convertOvpn(malformed,ipA),/client identity/);
+});
 test('incompatible/tricky OpenVPN profiles fail closed',()=>{
   const bad=[
     ovpn(ipA,{script:'up /tmp/evil.sh'}),
