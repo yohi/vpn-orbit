@@ -106,7 +106,7 @@ export async function refreshProfile(env, fetchFn=fetch, now=Date.now()) {
   return {updatedAt:now,selectedCount:selected.length};
 }
 
-function readSnapshot(raw,now) {
+function readSnapshot(raw,now,approved) {
   if (!raw || raw.length > MAX_PROFILE_JSON + 1000) return null;
   try {
     const s = JSON.parse(raw);
@@ -117,6 +117,7 @@ function readSnapshot(raw,now) {
     if (cfg?.endpoints?.length !== 1 || cfg.endpoints[0].type !== 'openvpn-client' ||
         !Array.isArray(cfg.endpoints[0].servers) || cfg.endpoints[0].servers.length < 2 ||
         cfg.route?.final !== 'vpn-gate' || !cfg.endpoints[0].block_ipv6 || cfg.outbounds?.length) return null;
+    if (cfg.endpoints[0].servers.some(server => !isPublicIPv4(server.server) || !approved.has(server.server))) return null;
     return s;
   } catch { return null; }
 }
@@ -126,7 +127,9 @@ export async function handleRequest(request, env, now=Date.now()) {
   if (request.method !== 'GET') return response('Method Not Allowed',405,{Allow:'GET'});
   if (url.pathname !== '/profile.json' && url.pathname !== '/health') return response('Not Found',404);
   if (!env?.PROFILE_KV?.get) return response('Not configured',503);
-  const snapshot = readSnapshot(await env.PROFILE_KV.get(SNAPSHOT_KEY),now);
+  const approved = new Set((env.APPROVED_IPS || '').split(/[\s,]+/).filter(Boolean));
+  if (approved.size < 2 || [...approved].some(ip=>!isPublicIPv4(ip))) return response('No current approved profile',503);
+  const snapshot = readSnapshot(await env.PROFILE_KV.get(SNAPSHOT_KEY),now,approved);
   if (!snapshot) return response('No current approved profile',503);
   if (url.pathname === '/health') return response(JSON.stringify({status:'ready',ageSeconds:Math.floor((now-snapshot.updatedAt)/1000),
     servers:JSON.parse(snapshot.profile).endpoints[0].servers.length}),200,{'Content-Type':'application/json; charset=utf-8'});

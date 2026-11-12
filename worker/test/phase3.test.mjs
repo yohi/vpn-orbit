@@ -196,6 +196,21 @@ test('malformed KV snapshot never served',async()=>{
   const e=env();e.values.set('profile-v1','{"bad":true}');
   assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0)).status,503);
 });
+test('snapshot containing an IP removed from current approvals is not served',async()=>{
+  const e=env();
+  await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
+  e.APPROVED_IPS=ipA;
+
+  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000)).status,503);
+  assert.equal((await handleRequest(new Request('https://example.com/health'),e,t0+1000)).status,503);
+});
+test('snapshot is served when every remote remains currently approved',async()=>{
+  const e=env();
+  await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
+  e.APPROVED_IPS=`${ipA},${ipB},${ipC}`;
+
+  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000)).status,200);
+});
 test('less than two compatible approved remotes never replaced last good snapshot',async()=>{
   const e=env();
   await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);

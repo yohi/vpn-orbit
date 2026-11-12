@@ -13,7 +13,7 @@ Implement a **Cloudflare Worker source module**, deterministic tests, and a depl
 3. Parse CSV, keep `CountryShort=JP` and `APPROVED_IPS` entries; parse inline `.ovpn` profiles using a conservative directive whitelist. Reject unknown directives, external credential paths, malformed certs, private/reserved addresses, remote-IP mismatches, and insecure TLS options.
 4. Group candidates by **identical** TLS roots/control keys/ciphers/identity rules and credentials. Select the largest compatible group, preserving latency ordering; require **at least two distinct servers**. CA union is **not** supported.
 5. Generate one OpenVPN Client Endpoint with `servers` and the existing Phase 2 TUN/route/DNS structure. Write a validated snapshot into a single Workers KV key.
-6. `GET /profile.json` serves the current profile; `GET /health` reports only its age and number of remotes. A missing snapshot or one older than 2 hours receives HTTP 503; the Worker never emits a `direct` fallback route.
+6. `GET /profile.json` serves the current profile; `GET /health` reports only its age and number of remotes. A missing snapshot, one older than 2 hours, or one containing a remote no longer present in the current `APPROVED_IPS` receives HTTP 503; the Worker never emits a `direct` fallback route.
 
 **Important:** A VPN Gate CSV entry is NOT a live OpenVPN connection probe. A healthy API request alone does not establish that the chosen volunteers are reachable or that they will exit in Tokyo. KV is eventually consistent, and cannot support instantaneous failover. sing-box MT is responsible for VPN transport and switching; the Worker only updates the *candidate profile*.
 
@@ -41,7 +41,7 @@ The config template intentionally contains nonfunctional placeholders and does *
 
 ## Stop conditions / risk decisions
 
-- `<2` compatible, distinct approved servers: **no new KV write**. The previously validated snapshot can be served until its two-hour expiry, then HTTP 503. This does **not** disconnect a device that already cached a profile — actual fail-closed network behavior requires an independent iOS leak test.
+- `<2` compatible, distinct approved servers: **no new KV write**. The previous snapshot can be served until its two-hour expiry only while every remote in it remains in the current `APPROVED_IPS`; removing any remote from that list makes both `/profile.json` and `/health` return HTTP 503 immediately. This does **not** disconnect a device that already cached a profile — actual fail-closed network behavior requires an independent iOS leak test.
 - Unexpected API redirect, timeout, HTTP error, malformed CSV, unknown/malicious OpenVPN directive: **no new KV write**. Do not silently drop TLS checks or promote all JP servers to Tokyo-approved.
 - iOS Phase 2 failover is still NOT_TESTED: this Phase 3 is a *config distribution layer*, not an independent runtime failover solution.
 - Server's IP may be a data-center IP or its egress differs from its ingress. Tokyo classification can change at any time; Workers cannot certify the target app's current GeoIP interpretation. `APPROVED_IPS` is a human attestation, not self-healing Tokyo discovery.
