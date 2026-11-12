@@ -14,6 +14,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import shlex
 import ssl
 import sys
 from urllib.request import Request, urlopen
@@ -120,8 +121,10 @@ def _ca_pem(contents: str) -> str:
         raise UnsupportedProfile("inline CA must contain only PEM certificates")
     for encoded in certs:
         try:
-            ssl.PEM_cert_to_DER_cert("-----BEGIN CERTIFICATE-----\n" + encoded.strip() + "\n-----END CERTIFICATE-----")
-        except ValueError as exc:
+            certificate = "-----BEGIN CERTIFICATE-----\n" + encoded.strip() + "\n-----END CERTIFICATE-----"
+            ssl.PEM_cert_to_DER_cert(certificate)
+            ssl.create_default_context().load_verify_locations(cadata=certificate)
+        except (ValueError, ssl.SSLError) as exc:
             raise UnsupportedProfile("malformed CA PEM") from exc
     return contents.strip() + "\n"
 
@@ -154,6 +157,12 @@ def convert_ovpn(profile: str, *, expected_ip: str | None = None) -> dict:
             continue
         tokens = line.split()
         name = tokens[0].lower()
+        if name == "remote-cert-eku":
+            try:
+                tokens = shlex.split(line)
+            except ValueError as exc:
+                raise UnsupportedProfile("malformed remote-cert-eku quoting") from exc
+            name = tokens[0].lower()
         if name not in IGNORABLE | {
             "proto", "remote", "cipher", "data-ciphers", "data-ciphers-fallback",
             "auth", "auth-user-pass", "key-direction", "remote-cert-tls", "verify-x509-name",
@@ -182,18 +191,35 @@ def convert_ovpn(profile: str, *, expected_ip: str | None = None) -> dict:
     if protocol not in {"udp", "udp4", "tcp", "tcp-client", "tcp4", "tcp4-client"}:
         raise UnsupportedProfile("unsupported proto")
     network = "udp" if protocol.startswith("udp") else "tcp"
+    dev = _one(directives, "dev")
+    if dev is not None and (len(dev) != 1 or re.fullmatch(r"tun[0-9]*", dev[0].lower()) is None):
+        raise UnsupportedProfile("only TUN devices are supported")
+    dev_type = _one(directives, "dev-type")
+    if dev_type is not None and (len(dev_type) != 1 or dev_type[0].lower() != "tun"):
+        raise UnsupportedProfile("only TUN devices are supported")
     if "ca" not in blocks:
         raise UnsupportedProfile("inline <ca> required (external trust paths not accepted)")
-    tls = {"certificate": [_ca_pem(blocks["ca"])], "remote_certificate_tls": "server"}
+    remote_cert_eku = _one(directives, "remote-cert-eku")
+    remote_cert = _one(directives, "remote-cert-tls")
+    if remote_cert_eku is not None:
+        if len(remote_cert_eku) != 1 or not remote_cert_eku[0]:
+            raise UnsupportedProfile("invalid remote-cert-eku")
+        if remote_cert is not None:
+            raise UnsupportedProfile("remote-cert-eku conflicts with remote-cert-tls")
+        tls = {
+            "certificate": [_ca_pem(blocks["ca"])],
+            "remote_certificate_eku": remote_cert_eku[0],
+        }
+    else:
+        tls = {"certificate": [_ca_pem(blocks["ca"])], "remote_certificate_tls": "server"}
     cert_name = _one(directives, "verify-x509-name")
-    if cert_name:
+    if cert_name is not None:
         if not 1 <= len(cert_name) <= 2 or len(cert_name[0]) > 256:
             raise UnsupportedProfile("invalid verify-x509-name")
         name_type = cert_name[1] if len(cert_name) == 2 else "name"
         if name_type not in {"name", "subject", "name-prefix"}:
             raise UnsupportedProfile("unsupported verify-x509-name type")
         tls.update({"server_name": cert_name[0], "server_name_type": name_type})
-    remote_cert = _one(directives, "remote-cert-tls")
     if remote_cert is not None and remote_cert != ["server"]:
         raise UnsupportedProfile("expected remote-cert-tls server")
     if "tls-auth" in blocks and "tls-crypt" in blocks:
@@ -206,11 +232,24 @@ def convert_ovpn(profile: str, *, expected_ip: str | None = None) -> dict:
         if wrap in blocks:
             ctl = {"type": "tls_auth" if wrap == "tls-auth" else "tls_crypt", "key": _static_key(blocks[wrap])}
             if wrap == "tls-auth":
-                direction = _one(directives, "key-direction")
-                if direction:
-                    if direction != ["1"]:
-                        raise UnsupportedProfile("only client tls-auth key-direction 1 supported")
-                    ctl["direction"] = "client"
+                auth_options = _one(directives, "tls-auth")
+                directive_direction = None
+                if auth_options is not None:
+                    if len(auth_options) not in (1, 2) or auth_options[0] != "[inline]":
+                        raise UnsupportedProfile("inline tls-auth directive must use [inline]")
+                    if len(auth_options) == 2:
+                        directive_direction = auth_options[1]
+                key_direction = _one(directives, "key-direction")
+                if key_direction is not None:
+                    if len(key_direction) != 1 or key_direction[0] not in {"0", "1"}:
+                        raise UnsupportedProfile("tls-auth key-direction must be 0 or 1")
+                    if directive_direction is not None and directive_direction != key_direction[0]:
+                        raise UnsupportedProfile("conflicting tls-auth direction specifications")
+                    directive_direction = key_direction[0]
+                if directive_direction is not None:
+                    if directive_direction not in {"0", "1"}:
+                        raise UnsupportedProfile("tls-auth direction must be 0 or 1")
+                    ctl["direction"] = "server" if directive_direction == "0" else "client"
             elif "key-direction" in directives:
                 raise UnsupportedProfile("key-direction must not accompany tls-crypt")
             tls["control_wrap"] = ctl
@@ -243,7 +282,7 @@ def convert_ovpn(profile: str, *, expected_ip: str | None = None) -> dict:
         "server": ip, "server_port": port, "network": network,
         "tls": tls, "data_ciphers": list(dict.fromkeys(allowed)),
         "data_ciphers_fallback": fallback[0].upper(), "auth": auth[0].upper(),
-        "ping_interval": "10s", "ping_restart": "40s",
+        "block_ipv6": True, "ping_interval": "10s", "ping_restart": "40s",
     }
     if user_pass is not None:
         endpoint["username"] = os.getenv("VPN_ORBIT_USERNAME", "vpn")
@@ -259,7 +298,9 @@ def build_config(endpoint: dict) -> dict:
             "servers": [{"type": "udp", "tag": "vpn-dns", "server": "1.1.1.1", "server_port": 53, "detour": "vpn-gate"}],
             "final": "vpn-dns",
         },
-        "inbounds": [{"type": "tun", "tag": "tun-in", "address": ["172.28.250.1/30"],
+        "inbounds": [{"type": "tun", "tag": "tun-in",
+                      "address": ["172.28.250.1/30", "fd28:250::1/126"],
+                      "inet6_route_address": ["::/1", "8000::/1"],
                       "auto_route": True, "dns_mode": "hijack", "mtu": 1400}],
         "endpoints": [endpoint],
         "route": {"rules": [{"protocol": "dns", "action": "hijack-dns"}], "final": "vpn-gate"},
