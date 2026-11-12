@@ -4,26 +4,46 @@ const SNAPSHOT_KEY = 'profile-v1';
 const MAX_AGE_MS = 2 * 60 * 60 * 1000; // Serve nothing if last refresh is older than 2h.
 const MAX_PROFILE_JSON = 512 * 1024;
 const PROBE_TIMEOUT_MS = 14000;
+const REFRESH_ERROR_CODES = new Set([
+  'PROFILE_KV_MISSING','APPROVED_IPS_INVALID','MAX_SERVERS_INVALID',
+  'API_FETCH_FAILED','API_RESPONSE_INVALID','CATALOG_TOO_LARGE',
+  'CATALOG_BODY_MISSING','CATALOG_ENCODING_INVALID','CATALOG_INVALID',
+  'INSUFFICIENT_COMPATIBLE_SERVERS','GROUP_SELECTION_FAILED',
+  'PROFILE_BUILD_FAILED','PROFILE_TOO_LARGE','SNAPSHOT_WRITE_FAILED',
+]);
+
+class RefreshError extends Error {
+  constructor(code,message,options) {
+    super(message,options);
+    this.code=code;
+  }
+}
+
+function refreshErrorCode(error) {
+  return error instanceof RefreshError && REFRESH_ERROR_CODES.has(error.code)
+    ? error.code
+    : 'REFRESH_FAILED';
+}
 
 function response(message,status,headers={}) {
   return new Response(message,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers}});
 }
 
 export async function refreshProfile(env, fetchFn=fetch, now=Date.now()) {
-  if (!env?.PROFILE_KV?.put) throw new Error('PROFILE_KV is required');
+  if (!env?.PROFILE_KV?.put) throw new RefreshError('PROFILE_KV_MISSING','PROFILE_KV is required');
   const approved = new Set((env.APPROVED_IPS || '').split(/[\s,]+/).filter(Boolean));
-  if (approved.size < 2 || [...approved].some(ip=>!isPublicIPv4(ip))) throw new Error('APPROVED_IPS requires at least 2 valid public IPv4 addresses');
+  if (approved.size < 2 || [...approved].some(ip=>!isPublicIPv4(ip))) throw new RefreshError('APPROVED_IPS_INVALID','APPROVED_IPS requires at least 2 valid public IPv4 addresses');
   const count = env.MAX_SERVERS === undefined ? 5 : Number(env.MAX_SERVERS);
-  if (!Number.isInteger(count) || count < 2 || count > 20) throw new Error('MAX_SERVERS must be 2-20');
+  if (!Number.isInteger(count) || count < 2 || count > 20) throw new RefreshError('MAX_SERVERS_INVALID','MAX_SERVERS must be 2-20');
   const controller = new AbortController();
   const timeout = setTimeout(()=>controller.abort(),PROBE_TIMEOUT_MS);
   let csv;
   try {
     const res = await fetchFn(API_URL,{signal:controller.signal,headers:{Accept:'text/plain'}});
-    if (!res.ok || new URL(res.url || API_URL).href !== API_URL) throw new Error('unexpected API response or redirect');
-    if (Number(res.headers?.get('content-length') || 0) > MAX_CATALOG_BYTES) throw new Error('catalog too large');
+    if (!res.ok || new URL(res.url || API_URL).href !== API_URL) throw new RefreshError('API_RESPONSE_INVALID','unexpected API response or redirect');
+    if (Number(res.headers?.get('content-length') || 0) > MAX_CATALOG_BYTES) throw new RefreshError('CATALOG_TOO_LARGE','catalog too large');
     const reader = res.body?.getReader();
-    if (!reader) throw new Error('catalog response body missing');
+    if (!reader) throw new RefreshError('CATALOG_BODY_MISSING','catalog response body missing');
     const chunks = [];
     let total = 0;
     try {
@@ -33,7 +53,7 @@ export async function refreshProfile(env, fetchFn=fetch, now=Date.now()) {
         total += value.byteLength;
         if (total > MAX_CATALOG_BYTES) {
           await reader.cancel();
-          throw new Error('catalog too large');
+          throw new RefreshError('CATALOG_TOO_LARGE','catalog too large');
         }
         chunks.push(value);
       }
@@ -41,16 +61,48 @@ export async function refreshProfile(env, fetchFn=fetch, now=Date.now()) {
     const bytes = new Uint8Array(total);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk,offset); offset += chunk.byteLength; }
-    csv = new TextDecoder('utf-8',{fatal:true}).decode(bytes);
+    try {
+      csv = new TextDecoder('utf-8',{fatal:true}).decode(bytes);
+    } catch (error) {
+      throw new RefreshError('CATALOG_ENCODING_INVALID','catalog is not valid UTF-8',{cause:error});
+    }
+  } catch (error) {
+    if (error instanceof RefreshError) throw error;
+    throw new RefreshError('API_FETCH_FAILED','catalog fetch failed',{cause:error});
   } finally { clearTimeout(timeout); }
-  const candidates = parseCatalog(csv,approved);
-  const {endpoint,selected} = selectGroup(candidates,count);
-  const config = buildConfig(endpoint);
+  let candidates;
+  try {
+    candidates = parseCatalog(csv,approved);
+  } catch (error) {
+    throw new RefreshError('CATALOG_INVALID','catalog could not be parsed',{cause:error});
+  }
+  let endpoint,selected;
+  try {
+    ({endpoint,selected} = selectGroup(candidates,count));
+  } catch (error) {
+    const code = error instanceof Error && error.message === 'fewer than two compatible approved VPN Gate servers'
+      ? 'INSUFFICIENT_COMPATIBLE_SERVERS'
+      : 'GROUP_SELECTION_FAILED';
+    const message = code === 'INSUFFICIENT_COMPATIBLE_SERVERS'
+      ? 'fewer than two compatible approved VPN Gate servers'
+      : 'compatible approved server selection failed';
+    throw new RefreshError(code,message,{cause:error});
+  }
+  let config;
+  try {
+    config = buildConfig(endpoint);
+  } catch (error) {
+    throw new RefreshError('PROFILE_BUILD_FAILED','profile generation failed',{cause:error});
+  }
   const profile = JSON.stringify(config);
-  if (profile.length > MAX_PROFILE_JSON) throw new Error('generated profile too large');
+  if (profile.length > MAX_PROFILE_JSON) throw new RefreshError('PROFILE_TOO_LARGE','generated profile too large');
   const snapshot = JSON.stringify({updatedAt:now,profile});
   // A failed refresh must never overwrite the previous valid snapshot.
-  await env.PROFILE_KV.put(SNAPSHOT_KEY,snapshot);
+  try {
+    await env.PROFILE_KV.put(SNAPSHOT_KEY,snapshot);
+  } catch (error) {
+    throw new RefreshError('SNAPSHOT_WRITE_FAILED','profile snapshot write failed',{cause:error});
+  }
   return {updatedAt:now,selectedCount:selected.length};
 }
 
@@ -86,7 +138,7 @@ export default {
   async scheduled(_controller,env,ctx) {
     ctx.waitUntil(refreshProfile(env).catch(err=>{
       // Avoid logging candidate profiles, CA contents, secrets or query parameters.
-      console.error('Profile refresh failed:',err?.name || 'Error');
+      console.error('Profile refresh failed:',refreshErrorCode(err));
     }));
   }
 };

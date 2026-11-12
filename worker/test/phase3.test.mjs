@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {convertOvpn,parseCatalog,selectGroup,buildConfig,isPublicIPv4,parseCsvLine} from '../src/catalog.mjs';
-import {refreshProfile,handleRequest} from '../src/index.mjs';
+import worker,{refreshProfile,handleRequest} from '../src/index.mjs';
 const fixture = (name)=>readFileSync(new URL(`./fixtures/${name}`,import.meta.url),'utf8');
 const cert = fixture('a.pem');
 const cert2 = fixture('b.pem');
@@ -104,6 +104,51 @@ test('unapproved or single approved IP cannot trigger publication',async()=>{
   const e=env(ipA);
   await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0),/APPROVED_IPS/);
   assert.equal(e.writes.length,0);
+});
+test('scheduled refresh logs fixed failure codes without exception details',async()=>{
+  const originalError=console.error;
+  const logged=[];
+  console.error=(...args)=>logged.push(args);
+  try {
+    const promises=[];
+    await worker.scheduled({},env(ipA),{waitUntil:promise=>promises.push(promise)});
+    await Promise.all(promises);
+  } finally {
+    console.error=originalError;
+  }
+  assert.deepEqual(logged,[['Profile refresh failed:','APPROVED_IPS_INVALID']]);
+});
+test('scheduled refresh identifies insufficient compatible servers without profile details',async()=>{
+  const originalError=console.error;
+  const originalFetch=globalThis.fetch;
+  const logged=[];
+  console.error=(...args)=>logged.push(args);
+  globalThis.fetch=fakeFetch(csv(row(ipA)));
+  try {
+    const promises=[];
+    await worker.scheduled({},env(),{waitUntil:promise=>promises.push(promise)});
+    await Promise.all(promises);
+  } finally {
+    console.error=originalError;
+    globalThis.fetch=originalFetch;
+  }
+  assert.deepEqual(logged,[['Profile refresh failed:','INSUFFICIENT_COMPATIBLE_SERVERS']]);
+});
+test('scheduled refresh maps transport errors to a fixed code',async()=>{
+  const originalError=console.error;
+  const originalFetch=globalThis.fetch;
+  const logged=[];
+  console.error=(...args)=>logged.push(args);
+  globalThis.fetch=async()=>{throw new Error('sensitive transport detail');};
+  try {
+    const promises=[];
+    await worker.scheduled({},env(),{waitUntil:promise=>promises.push(promise)});
+    await Promise.all(promises);
+  } finally {
+    console.error=originalError;
+    globalThis.fetch=originalFetch;
+  }
+  assert.deepEqual(logged,[['Profile refresh failed:','API_FETCH_FAILED']]);
 });
 test('API outage does not erase last valid record, but stale record is not served',async()=>{
   const e=env();
