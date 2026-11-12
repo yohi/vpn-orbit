@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.ovpn
+*.json
+!tests/fixtures/*.json
+.profile-output/
