@@ -13,8 +13,7 @@ const IGNORED = new Set([
   'resolv-retry','verb','mute','remote-random','remote-random-hostname',
   'connect-retry','connect-retry-max','server-poll-timeout','ping','ping-restart',
   'ping-timer-rem','explicit-exit-notify','reneg-sec','sndbuf','rcvbuf',
-  'auth-nocache','route-delay','setenv','setenv-safe','pull','tls-client',
-  'remote-cert-eku'
+  'auth-nocache','route-delay','setenv','setenv-safe','pull','tls-client'
 ]);
 const ALLOWED = new Set([
   'proto','remote','cipher','data-ciphers','data-ciphers-fallback','auth',
@@ -68,40 +67,70 @@ function one(map, key, fallback) {
   return all.length ? all[0] : fallback;
 }
 
+function pemBody(body, begin, end, linePattern, maxLines) {
+  const lines = body.replace(/\r\n/g, '\n').split('\n');
+  while (lines.length && lines[0] === '') lines.shift();
+  while (lines.length && lines.at(-1) === '') lines.pop();
+  if (lines.length < 3 || lines[0] !== begin || lines.at(-1) !== end) throw new Error('invalid PEM boundaries');
+  const encoded = lines.slice(1, -1);
+  if (encoded.length > maxLines || encoded.some(line => line.length > 64 || !linePattern.test(line))) throw new Error('invalid PEM body');
+  return encoded;
+}
+
 function validateCerts(body) {
   const certs = [];
-  const stripped = body.replace(/-----BEGIN CERTIFICATE-----\s+([A-Za-z0-9+/=\s]+?)\s+-----END CERTIFICATE-----/g, (_, encoded) => {
-    const joined = encoded.replace(/\s+/g, '');
+  const lines = body.replace(/\r\n/g, '\n').split('\n');
+  let index = 0;
+  while (index < lines.length) {
+    if (lines[index] === '') { index++; continue; }
+    if (lines[index] !== '-----BEGIN CERTIFICATE-----') throw new Error('inline CA must contain certificates only');
+    const end = lines.indexOf('-----END CERTIFICATE-----', index + 1);
+    if (end < 0) throw new Error('invalid certificate boundaries');
+    const encodedLines = pemBody(lines.slice(index, end + 1).join('\n'), '-----BEGIN CERTIFICATE-----', '-----END CERTIFICATE-----', /^[A-Za-z0-9+/]+={0,2}$/, 2048);
+    const joined = encodedLines.join('');
     const bytes = decodeBase64(joined);
     if (bytes.length < 64 || bytes[0] !== 0x30) throw new Error('invalid certificate DER');
     certs.push(`-----BEGIN CERTIFICATE-----\n${joined.match(/.{1,64}/g).join('\n')}\n-----END CERTIFICATE-----\n`);
-    return '';
-  });
-  if (!certs.length || certs.length > 6 || stripped.trim()) throw new Error('inline CA must contain certificates only');
+    index = end + 1;
+  }
+  if (!certs.length || certs.length > 6) throw new Error('inline CA must contain certificates only');
   return certs;
 }
 
 function validateStaticKey(body) {
-  const match = body.trim().match(/^-----BEGIN OpenVPN Static key V1-----\s+([0-9a-fA-F\s]+?)\s+-----END OpenVPN Static key V1-----$/s);
-  if (!match || match[1].replace(/\s+/g,'').length !== 512) throw new Error('invalid static key');
-  return body.trim() + '\n';
+  const lines = pemBody(body.trim(), '-----BEGIN OpenVPN Static key V1-----', '-----END OpenVPN Static key V1-----', /^[0-9a-fA-F]+$/, 16);
+  const hex = lines.join('');
+  if (hex.length !== 512) throw new Error('invalid static key');
+  return `-----BEGIN OpenVPN Static key V1-----\n${lines.join('\n')}\n-----END OpenVPN Static key V1-----\n`;
 }
 
 function validateClientKey(body) {
-  const match = body.trim().match(/^-----BEGIN (RSA )?PRIVATE KEY-----\s+([A-Za-z0-9+/=\s]+?)\s+-----END \1PRIVATE KEY-----$/s);
-  if (!match) throw new Error('invalid client identity key');
-  const der = decodeBase64(match[2].replace(/\s+/g, ''));
+  const trimmed = body.trim();
+  const first = trimmed.split(/\r?\n/, 1)[0];
+  const algorithm = first === '-----BEGIN RSA PRIVATE KEY-----' ? 'RSA ' : first === '-----BEGIN PRIVATE KEY-----' ? '' : null;
+  if (algorithm === null) throw new Error('invalid client identity key');
+  const lines = pemBody(trimmed, `-----BEGIN ${algorithm}PRIVATE KEY-----`, `-----END ${algorithm}PRIVATE KEY-----`, /^[A-Za-z0-9+/]+={0,2}$/, 2048);
+  const der = decodeBase64(lines.join(''));
   if (der.length < 32 || der[0] !== 0x30) throw new Error('invalid client identity key');
 }
 
 export function convertOvpn(profile, expectedIp) {
   if (typeof profile !== 'string' || new TextEncoder().encode(profile).length > MAX_PROFILE_BYTES) throw new Error('profile too large');
   const blocks = new Map();
-  let rest = profile.replace(/^<(ca|tls-auth|tls-crypt|cert|key)>\s*\r?\n([\s\S]*?)^<\/\1>\s*$/gm, (_, key, value) => {
+  const restLines = [];
+  const lines = profile.replace(/\r\n/g, '\n').split('\n');
+  for (let i=0; i<lines.length; i++) {
+    const open = /^<(ca|tls-auth|tls-crypt|cert|key)>$/.exec(lines[i]);
+    if (!open) { restLines.push(lines[i]); continue; }
+    const key = open[1];
     if (blocks.has(key)) throw new Error('duplicate inline block');
-    blocks.set(key, value);
-    return '';
-  });
+    const close = `</${key}>`;
+    const end = lines.indexOf(close, i + 1);
+    if (end < 0) throw new Error('invalid inline block boundaries');
+    blocks.set(key, lines.slice(i + 1, end).join('\n'));
+    i = end;
+  }
+  const rest = restLines.join('\n');
   if (/^\s*<\/?[a-z]/im.test(rest)) throw new Error('unsupported inline block');
   if (blocks.has('cert') !== blocks.has('key')) throw new Error('client identity certificate and key must be paired');
   if (blocks.has('cert')) {

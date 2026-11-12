@@ -50,6 +50,34 @@ test('client identity blocks must be paired and contain valid PEM encoding',()=>
   assert.throws(()=>convertOvpn(certOnly,ipA),/client identity/);
   assert.throws(()=>convertOvpn(malformed,ipA),/client identity/);
 });
+test('remote-cert-eku is rejected as an unsupported directive',()=>{
+  assert.throws(()=>convertOvpn(ovpn(ipA,{script:'remote-cert-eku \\ TLS Web Server Authentication'}),ipA),/unsupported directive: remote-cert-eku/);
+});
+test('PEM bodies reject overlong base64 lines and malformed boundary lines',()=>{
+  const longLine='A'.repeat(65);
+  const badLineBreaks=cert.replace('-----BEGIN CERTIFICATE-----','-----BEGIN CERTIFICATE----- extra');
+  const payload=cert.split('\n').slice(1,-2).join('');
+  const overlongLines=`-----BEGIN CERTIFICATE-----\n${payload.match(/.{1,65}/g).join('\n')}\n-----END CERTIFICATE-----\n`;
+  for(const ca of [cert.replace(/\n[^\n]+\n/,`\n${longLine}\n`),overlongLines,badLineBreaks]) {
+    assert.throws(()=>convertOvpn(ovpn(ipA,{ca}),ipA));
+  }
+});
+test('static keys reject invalid line structure and excessive line lengths',()=>{
+  const keyBody='a'.repeat(512);
+  const validKey=`-----BEGIN OpenVPN Static key V1-----\n${keyBody.match(/.{1,64}/g).join('\n')}\n-----END OpenVPN Static key V1-----`;
+  const invalidKey=`-----BEGIN OpenVPN Static key V1-----\n${keyBody}\n-----END OpenVPN Static key V1-----`;
+  for(const control of [validKey,invalidKey]) {
+    const profile=ovpn(ipA,{control:`<tls-crypt>\n${control}\n</tls-crypt>`});
+    if(control===validKey) assert.doesNotThrow(()=>convertOvpn(profile,ipA));
+    else assert.throws(()=>convertOvpn(profile,ipA));
+  }
+});
+test('client private keys reject base64 lines longer than 64 characters',()=>{
+  const payload=Buffer.concat([Buffer.from([0x30]),Buffer.alloc(99,1)]).toString('base64');
+  const key=`-----BEGIN RSA PRIVATE KEY-----\n${payload.match(/.{1,65}/g).join('\n')}\n-----END RSA PRIVATE KEY-----`;
+  const profile=ovpn(ipA).replace('</ca>',`</ca>\n<cert>\n${cert}</cert>\n<key>\n${key}\n</key>`);
+  assert.throws(()=>convertOvpn(profile,ipA),/client identity/);
+});
 test('incompatible/tricky OpenVPN profiles fail closed',()=>{
   const bad=[
     ovpn(ipA,{script:'up /tmp/evil.sh'}),
