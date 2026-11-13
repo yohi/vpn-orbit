@@ -325,7 +325,22 @@ def convert_ovpn(profile: str, *, expected_ip: str | None = None) -> dict:
 
 
 def build_config(endpoint: dict) -> dict:
-    """Full single-VPN candidate config for a *manual* sing-box MT Phase 1 test."""
+    """Full single- or multi-remote sing-box MT config with explicit server bypass."""
+    if not isinstance(endpoint, dict) or endpoint.get("type") != "openvpn-client":
+        raise UnsupportedProfile("expected OpenVPN client endpoint")
+    single, multi = "server" in endpoint, "servers" in endpoint
+    if single == multi:
+        raise UnsupportedProfile("exactly one OpenVPN remote form is required")
+    remotes = [endpoint] if single else endpoint["servers"]
+    if not isinstance(remotes, list) or not remotes or any(
+        not isinstance(item, dict) or not isinstance(item.get("server"), str)
+        for item in remotes
+    ):
+        raise UnsupportedProfile("invalid OpenVPN remote list")
+    ips = [require_global_ipv4(item["server"]) for item in remotes]
+    if len(ips) != len(set(ips)):
+        raise UnsupportedProfile("duplicate OpenVPN server IP")
+
     return {
         "log": {"level": "warn"},
         "dns": {
@@ -334,8 +349,11 @@ def build_config(endpoint: dict) -> dict:
         },
         "inbounds": [{"type": "tun", "tag": "tun-in",
                       "address": ["172.28.250.1/30", "fd28:250::1/126"],
-                      "inet6_route_address": ["::/1", "8000::/1"],
-                      "auto_route": True, "dns_mode": "hijack", "mtu": 1400}],
+                      "auto_route": True,
+                      # Keep route_address unset: a split default route broke iOS default-interface discovery.
+                      # Bypass only the verified OpenVPN ingress IPs to avoid tunneling the transport.
+                      "route_exclude_address": [f"{ip}/32" for ip in ips],
+                      "dns_mode": "hijack", "mtu": 1400}],
         "endpoints": [endpoint],
         "route": {"rules": [{"protocol": "dns", "action": "hijack-dns"}], "final": "vpn-gate"},
     }

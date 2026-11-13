@@ -2,7 +2,7 @@
 
 VPN GateのOpenVPN接続設定から、iOS/iPadOS向け **sing-box MT 1.14+** のプロファイルを生成するPoCです。Phase 1（単一接続先）に、Phase 2（互換な複数OpenVPN接続先での再接続）を積み上げています。
 
-**現状：ローカル変換テストの段階です。iPhone/iPadの実VPN接続、東京GeoIP判定、障害時の無操作フェイルオーバーは未確認です。** Workersデプロイ、クラウドへの書込みは含みません。
+**現状：2026-11-13にiPhoneのsing-box MTで、単一VPN Gate接続と外向きIPv4の変化を実機確認しました（TCP 218.226.0.144:1822、位置判定は三重県）。** ただし実機成功時のJSONは手動でTUN経路を修正したものです。この修正を生成器へ取り込んだ後の再接続確認、東京GeoIP判定、iPad、障害時の無操作フェイルオーバーは未検証です。Workersデプロイ、クラウドへの書込みは含みません。
 
 ## 目的・範囲
 
@@ -38,7 +38,7 @@ python3 -m unittest discover -s tests -v
 - `.ovpn`のインラインCA必須、リモートIPはグローバルIPv4のみ。外部ファイル、未知のディレクティブ、スクリプト実行、複雑なTLS/暗号設定は拒否します。VPN Gate公開サーバーをすべて変換できるわけではありません。
 - TLSのCAとサーバー用途を検証する設定を生成します。元ファイルに`verify-x509-name`がある場合は引き継ぎます。ない場合は特定のサーバー名との照合は行わないため、公開CA信頼の限界が残ります。
 - `JP`で選別しても**東京のIPと判定される保証はありません**。実際の接続後、利用したいアプリと複数のGeoIP確認サービスで判断してください。
-- JSONの構文・自動テスト通過は、sing-box MTでのロード成功やVPN接続成功を意味しません。**現環境ではsing-box 1.14バイナリおよび実機による検証は未実施**です。
+- JSONの構文・自動テスト通過は実機のVPN接続成功を意味しません。2026-11-13に**手動調整した単一サーバーJSONでiPhone実機接続を確認**しましたが、修正後の生成器から作ったJSONそのものとPhase 2/3の実機動作は未検証です。
 - TUN切断時の直接接続復帰、DNS/IPv6漏れを防ぐ「完全なKill Switch」は実証していません。機密通信や位置保証の必要な利用には使わないでください。
 - ローカルVPNはiOSの他のVPN（WARP等）と競合する可能性があります。検証時は併用しないでください。
 
@@ -59,7 +59,7 @@ sing-boxは1つのOpenVPN Client Endpointに`servers`配列を設定でき、接
 
 詳細な条件と実機試験は [docs/phase2-ios.md](docs/phase2-ios.md) を参照。単体テストは `python3 -m unittest discover -s tests -v`。Phase 2は**コンバーター実装**であり、iOS実機での自動切替成功ではありません。
 
-Phase 1の実機テストは [docs/phase1-ios.md](docs/phase1-ios.md) を参照。
+Phase 1の実機テストは [docs/phase1-ios.md](docs/phase1-ios.md) を参照。生成するTUNは `auto_route: true` の標準経路を使い、廃止済み `inet6_route_address` と明示的 `route_address` を出力しません。OpenVPN接続先IPのみ `route_exclude_address` でTUNから除外します（その宛先への通信は直接経路になる）。複数接続先では全登録IPを除外します。これ自体はKill SwitchやIPv6/DNS漏れ防止を保証しません。
 
 ## 参照
 

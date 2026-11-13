@@ -42,8 +42,23 @@ class Phase1Tests(unittest.TestCase):
         self.assertEqual(full["route"]["final"], "vpn-gate")
         self.assertNotIn("outbounds", full)
         self.assertEqual(full["dns"]["servers"][0]["detour"], "vpn-gate")
-        self.assertEqual(full["inbounds"][0]["inet6_route_address"], ["::/1", "8000::/1"])
+        self.assertEqual(full["inbounds"][0]["route_exclude_address"], ["8.8.8.8/32"])
+        self.assertNotIn("route_address", full["inbounds"][0])
+        self.assertNotIn("inet6_route_address", full["inbounds"][0])
+        self.assertEqual(full["inbounds"][0]["address"], ["172.28.250.1/30", "fd28:250::1/126"])
         self.assertTrue(endpoint["block_ipv6"])
+
+    def test_route_exclusions_fail_closed_for_invalid_or_ambiguous_remotes(self):
+        endpoint = convert_ovpn(PROFILE)
+        for bad_ip in ("192.168.1.1", "203.0.113.4", "8.8.8.8/32"):
+            with self.subTest(ip=bad_ip), self.assertRaises(UnsupportedProfile):
+                build_config({**endpoint, "server": bad_ip})
+        with self.assertRaises(UnsupportedProfile):
+            build_config({**endpoint, "servers": [{"server": "9.9.9.9"}]})
+        with self.assertRaises(UnsupportedProfile):
+            build_config({**endpoint, "server": 134744072})
+        with self.assertRaises(UnsupportedProfile):
+            build_config({**endpoint, "server": "8.8.8.8", "type": "direct"})
 
     def test_credential_defaults_only_when_requested(self):
         self.assertNotIn("username", convert_ovpn(PROFILE))

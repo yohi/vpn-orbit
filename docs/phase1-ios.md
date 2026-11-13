@@ -4,12 +4,18 @@
 
 sing-box MTへ生成したJSONをインポートし、VPN GateサーバーへのVPN接続が実際に確立する。IP確認サイトで**VPN接続前後の出口IPv4が変化**し、Wi-Fiと携帯網のいずれかで通信できることを確認する。東京判定は追加観測であり、Phase 1の必須条件にはしない。
 
+## 2026-11-13の実機観測（参考）
+
+- iPhoneのsing-box MTで、手動修正した単一サーバーのJSONにより `218.226.0.144:1822/TCP` へのOpenVPNトンネル確立ログを確認。DNS応答とTCP送受信も観測され、外向きIPv4が変化した。地域判定は三重県で、東京要件は未達。
+- 互換性のない `inet6_route_address` を削除し、`auto_route: true` の下で明示的な `route_address` を指定しない構成でデフォルトWi-Fiインターフェースの認識が回復した。接続先IPv4の `route_exclude_address` は維持。
+- この時点で成功したのは**手動修正済みJSON**であり、生成器修正後のJSON、iPad、IPv6/DNS漏れ、フェイルオーバーは未検証。VPN GateのIPとポートは変動し得るため固定の推奨接続先ではない。
+
 ## 手順
 
 1. iPhone/iPadにsing-box MTをインストールする（公式App Storeの提供元を確認）。WARPや他のVPNは検証中OFFにする。
 2. PCから `python3 -m vpn_orbit.phase1 --from-vpngate --list` で候補を確認。取れない場合はVPN Gate公式から`.ovpn`を取得してローカル変換する。
 3. `--index 1` などで1台のみJSONを生成。秘密情報を含む可能性があるため、公開リポジトリ・公開URLへアップロードしない。
-4. AirDropまたはAppleの「ファイル」経由で端末へ渡し、sing-box MTの**ローカル**プロファイルとして読み込む。VPN権限を許可する。
+4. LocalSend、AirDropまたはAppleの「ファイル」経由で端末へ渡し、sing-box MTの**ローカル**プロファイルとして読み込む。VPN権限を許可する。
 5. VPN開始前に、IPv4出口とIPv6出口を確認して記録する。IPv4は https://ipinfo.io/ など、IPv6は https://test-ipv6.com/ などを利用する。DNS漏えい確認サービスでも、表示されたDNSリゾルバー名・国や地域を記録する。
 6. sing-box MTで接続する。生成設定はIPv6をTUN経由でOpenVPN endpointへ送り、endpoint側でローカル拒否する構成なので、接続中はIPv4通信がVPN経由になり、IPv6通信は利用できないことを確認する。同じIPv4/IPv6確認とDNS漏えい確認を再実施し、接続前の値と比較する。IPv6の外部到達性が残る場合、DNSリゾルバーに接続元ISP等が表示される場合、または判定できない場合は合格にしない。
 7. sing-box MTで接続失敗した場合はエラー表示・アプリバージョン・選択した接続先プロトコル・非機密ログを記録する。証明書検証を無効化して通すことはしない。

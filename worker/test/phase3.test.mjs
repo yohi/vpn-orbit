@@ -33,7 +33,12 @@ test('OpenVPN profile generates independently verified CA and no unsafe directiv
   assert.equal(e.server,ipA);assert.equal(e.tls.remote_certificate_tls,'server');
   assert.equal(e.block_ipv6,true);
   assert.ok(e.tls.certificate[0].includes('BEGIN CERTIFICATE'));
-  assert.equal(buildConfig(e).route.final,'vpn-gate');
+  const cfg=buildConfig(e);
+  assert.equal(cfg.route.final,'vpn-gate');
+  assert.deepEqual(cfg.inbounds[0].route_exclude_address,[ipA+'/32']);
+  assert.deepEqual(cfg.inbounds[0].address,['172.28.250.1/30','fd28:250::1/126']);
+  assert.equal(Object.hasOwn(cfg.inbounds[0],'route_address'),false);
+  assert.equal(Object.hasOwn(cfg.inbounds[0],'inet6_route_address'),false);
 });
 test('SoftEther inline client identity is preserved for sing-box',()=>{
   const clientCert=cert;
@@ -155,9 +160,36 @@ test('cron refresh publishes fresh validated config without leaking candidates i
   assert.equal(res.headers.get('cache-control'),'no-store');
   const profile=await res.json();
   assert.deepEqual(profile.endpoints[0].servers.map(x=>x.server),[ipA,ipB]);
+  assert.deepEqual(profile.inbounds[0].route_exclude_address,[ipA+'/32',ipB+'/32']);
+  assert.equal(Object.hasOwn(profile.inbounds[0],'route_address'),false);
   const health=await handleRequest(new Request('https://example.com/health'),e,t0+1000);
   assert.equal(health.status,200);
   assert.deepEqual(await health.json(),{status:'ready',ageSeconds:1,servers:2});
+});
+test('builder rejects invalid or duplicate transport addresses',()=>{
+  const e=convertOvpn(ovpn(ipA),ipA);
+  assert.throws(()=>buildConfig({...e,server:'192.168.1.1'}),/invalid OpenVPN remote/);
+  assert.throws(()=>buildConfig({...e,servers:[{server:ipA}]}),/exactly one OpenVPN remote/);
+  const multi={...e};delete multi.server;delete multi.server_port;delete multi.network;
+  multi.servers=[{server:ipA},{server:ipA}];
+  assert.throws(()=>buildConfig(multi),/duplicate OpenVPN server/);
+});
+test('stale or tampered route exclusions fail closed on public profile read',async()=>{
+  const e=env();
+  await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
+  const original=e.values.get('profile-v1');
+  for (const mutation of [
+    cfg=>{cfg.inbounds[0].route_exclude_address.pop();},
+    cfg=>{cfg.inbounds[0].route_address=['0.0.0.0/1','128.0.0.0/1'];}
+  ]) {
+    const snapshot=JSON.parse(original), cfg=JSON.parse(snapshot.profile);
+    mutation(cfg);
+    snapshot.profile=JSON.stringify(cfg);
+    e.values.set('profile-v1',JSON.stringify(snapshot));
+    assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000)).status,503);
+  }
+  e.values.set('profile-v1',original);
+  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000)).status,200);
 });
 test('unapproved or single approved IP cannot trigger publication',async()=>{
   const e=env(ipA);

@@ -278,10 +278,21 @@ export function selectGroup(candidates, maxServers=5) {
 }
 
 export function buildConfig(endpoint) {
+  if (!endpoint || endpoint.type !== 'openvpn-client') throw new Error('expected OpenVPN client endpoint');
+  const single=Object.hasOwn(endpoint,'server'), multi=Object.hasOwn(endpoint,'servers');
+  if (single === multi) throw new Error('exactly one OpenVPN remote form is required');
+  const remotes=single ? [endpoint] : endpoint.servers;
+  if (!Array.isArray(remotes) || !remotes.length || remotes.some(item=>!item || !isPublicIPv4(item.server))) {
+    throw new Error('invalid OpenVPN remote list');
+  }
+  const ips=remotes.map(item=>item.server);
+  if (new Set(ips).size !== ips.length) throw new Error('duplicate OpenVPN server IP');
   return {
     log:{level:'warn'},
     dns:{servers:[{type:'udp',tag:'vpn-dns',server:'1.1.1.1',server_port:53,detour:'vpn-gate'}],final:'vpn-dns'},
-    inbounds:[{type:'tun',tag:'tun-in',address:['172.28.250.1/30'],auto_route:true,dns_mode:'hijack',mtu:1400}],
+    // No explicit route_address: iOS default-interface discovery failed with split default routes.
+    inbounds:[{type:'tun',tag:'tun-in',address:['172.28.250.1/30','fd28:250::1/126'],
+      auto_route:true,route_exclude_address:ips.map(ip=>ip+'/32'),dns_mode:'hijack',mtu:1400}],
     endpoints:[endpoint],
     route:{rules:[{protocol:'dns',action:'hijack-dns'}],final:'vpn-gate'}
   };

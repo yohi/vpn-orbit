@@ -4,7 +4,7 @@
 
 Implement a **Cloudflare Worker source module**, deterministic tests, and a deployment *template* to serve a single sing-box 1.14+ profile from a reviewed list of geographically verified VPN Gate servers. Stack this commit on Phase 2; **do not deploy, create cloud resources, modify accounts, or begin Phase 4**.
 
-**Implementation is not proof of runtime operation.** Phase 1 iOS OpenVPN connect, Phase 2 automatic reconnect/failover, Cloudflare Worker runtime, VPN Gate API accessibility from Cloudflare, and background profile refresh on sing-box MT all remain **NOT_TESTED** at integration level.
+**Implementation is not proof of runtime operation.** Phase 1 iPhone single-server OpenVPN connection and changed egress IPv4 were observed on 2026-11-13 using a manually adjusted local JSON (Tokyo was not reached). Regenerated JSON, Phase 2 automatic reconnect/failover, Cloudflare Worker runtime, VPN Gate API accessibility from Cloudflare, and background profile refresh on sing-box MT remain **NOT_TESTED** at integration level.
 
 ## Architecture
 

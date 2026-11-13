@@ -35,6 +35,10 @@ class Phase2Tests(unittest.TestCase):
         config = build_config(endpoint)
         self.assertEqual(config['route']['final'], 'vpn-gate')
         self.assertEqual(config['dns']['servers'][0]['detour'], 'vpn-gate')
+        self.assertEqual(config['inbounds'][0]['route_exclude_address'],
+                         ['8.8.8.8/32', '9.9.9.9/32'])
+        self.assertNotIn('route_address', config['inbounds'][0])
+        self.assertNotIn('inet6_route_address', config['inbounds'][0])
         self.assertNotIn('outbounds', config)
         self.assertFalse(result.ca_union)
 

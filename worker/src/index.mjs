@@ -125,6 +125,15 @@ function readSnapshot(raw,now,approved,allowPublicClientKeys=false) {
         !Array.isArray(cfg.endpoints[0].servers) || cfg.endpoints[0].servers.length < 2 ||
         cfg.route?.final !== 'vpn-gate' || !cfg.endpoints[0].block_ipv6 || cfg.outbounds?.length) return null;
     if (cfg.endpoints[0].servers.some(server => !isPublicIPv4(server.server) || !approved.has(server.server))) return null;
+    // Never serve a profile that routes its own VPN transport back into the TUN.
+    const tun = cfg.inbounds?.length === 1 ? cfg.inbounds[0] : null;
+    const excluded = cfg.endpoints[0].servers.map(remote => remote.server + '/32');
+    if (!tun || tun.type !== 'tun' || tun.auto_route !== true ||
+        !Array.isArray(tun.route_exclude_address) ||
+        tun.route_exclude_address.length !== excluded.length ||
+        excluded.some((ip, i) => tun.route_exclude_address[i] !== ip) ||
+        ['route_address', 'inet4_route_address', 'inet6_route_address',
+         'inet4_route_exclude_address', 'inet6_route_exclude_address'].some(key => key in tun)) return null;
     const tls = cfg.endpoints[0].tls;
     if (Boolean(tls?.client_certificate?.length) !== Boolean(tls?.client_key?.length)) return null;
     if (tls?.client_key?.length && !allowPublicClientKeys) return null;
