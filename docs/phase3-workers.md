@@ -113,3 +113,45 @@ unset VPN_ORBIT_TOKEN
 
 No Cloudflare resource is created by the GitHub changes.
 Remote Profile refresh in sing-box MT is still not runtime-verified.
+
+## GitHub Actions deployment (preferred; 2026-11-13)
+
+Use **GitHub Actions, not local `wrangler deploy`**. After merging this
+branch into `master`, open **Actions > VPN Orbit Worker > Run workflow**
+on `master`. `pull_request` only runs `npm test`; the deployment job
+cannot run on pull requests, pushes or non-master manual dispatches.
+
+Under **Repository Settings > Secrets and variables > Actions**, add:
+
+| Setting type | Name | Value |
+|---|---|---|
+| Secret | `CLOUDFLARE_API_TOKEN` | Account-scoped **Edit Cloudflare Workers** token, limited to the target account |
+| Secret | `PROFILE_ACCESS_TOKEN` | 64 hex characters from `openssl rand -hex 32`; keep a private local copy for iOS |
+| Variable | `CLOUDFLARE_ACCOUNT_ID` | 32-character Cloudflare account ID |
+| Variable | `CLOUDFLARE_KV_NAMESPACE_ID` | `8c2f963fe91f48b493d068d0a0fb7493` |
+
+The existing KV namespace is **reused** (even if renamed to
+`vpn-orbit-tokyo-profiles`); the Worker binding stays `PROFILE_KV`.
+No GitHub Variable is needed for the pinned Tokyo candidates; those exact
+IP:port/protocol pairs are in the committed Wrangler example.
+
+The workflow generates an ignored `worker/wrangler.jsonc` from the committed
+example, substitutes only the existing KV namespace ID, and sets
+`ALLOW_PUBLIC_CLIENT_KEYS=true` for the **already independently confirmed
+public shared VPN Gate key**. It validates the exact two authorized remotes,
+requires tests to pass, and uploads the `PROFILE_ACCESS_TOKEN` secret
+**atomically with the Worker deployment** using Wrangler `--secrets-file`.
+Temporary secret files are not committed and are deleted on step exit.
+Missing or malformed settings prevent deployment. The GitHub token is never
+written to the repo; it is used by Wrangler in the runner environment.
+
+The Worker still rejects unknown ports, different TLS profiles, stale KV
+snapshots and unauthenticated profile requests. If the VPN Gate public client
+key changes or the operator-verified pair becomes unavailable, no new
+profile is published. Auto-discovery of fresh Tokyo exit IPs and instantaneous
+iOS kill-switch safety are NOT established.
+
+The workflow becomes manually runnable only after it exists on the default
+branch (`master`). The GitHub integration does not deploy anything merely
+by adding this file to a feature branch. **Do not run a separate local
+`wrangler secret put`**, because that operation immediately deploys.
