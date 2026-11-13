@@ -72,7 +72,7 @@ Phase 1の実機テストは [docs/phase1-ios.md](docs/phase1-ios.md) を参照�
 
 VPN Gate/SoftEtherの.ovpnに含まれる`<cert>`/`<key>`をPhase 1とPhase 3で安全に解析し、sing-boxの`tls.client_certificate`/`tls.client_key`へ引き継ぎます。片方だけのペア、不正・暗号化PEMは拒否します。**PEM構造検査は証明書と鍵の暗号学的な一致や実機接続成功を証明しません。** Phase 2では異なるクライアントIDを同一Endpointへ結合しません。
 
-Workerの`/profile.json`は認証なしの公開URLです。クライアント秘密鍵を含む設定は`ALLOW_PUBLIC_CLIENT_KEYS="true"`を明示しない限り公開しません。この設定を有効化すると鍵をKV・公開JSONへ出力するため、**公開済みダミー鍵だとHuman Ownerが確認した場合だけ**承認してください。個人用認証情報には使用しないでください。詳細: [Phase 3](docs/phase3-workers.md)。
+Workerの`/profile.json`と`/health`は`PROFILE_ACCESS_TOKEN`（64文字の16進数）による認証が必要です。`Authorization: Bearer <token>`、またはsing-box MTのRemote Profile向けに`/profile.json?token=<token>`を使用します。認証がない・不正な場合はHTTP 401、WorkerにSecretが未設定の場合はHTTP 503を返します。トークンを含むURLは秘密情報として扱ってください。`ALLOW_PUBLIC_CLIENT_KEYS="true"`は公開済み共通テスト用クライアント鍵のKV保存と**認証付き配信**を許可する設定であり、認証を無効化しません。**公開済み共通鍵だとHuman Ownerが確認・承認した場合だけ**有効にし、個人固有・非公開の鍵には使用しないでください。詳細: [Phase 3](docs/phase3-workers.md)。
 
 ## Phase 3 — Cloudflare Workers / remote profile distribution
 
