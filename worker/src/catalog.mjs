@@ -112,6 +112,19 @@ function validateClientKey(body) {
   const lines = pemBody(trimmed, `-----BEGIN ${algorithm}PRIVATE KEY-----`, `-----END ${algorithm}PRIVATE KEY-----`, /^[A-Za-z0-9+/]+={0,2}$/, 2048);
   const der = decodeBase64(lines.join(''));
   if (der.length < 32 || der[0] !== 0x30) throw new Error('invalid client identity key');
+  const length = der[1];
+  let expected;
+  if (length < 0x80) expected = 2 + length;
+  else {
+    const n = length & 0x7f;
+    if (n < 1 || n > 4 || der.length < 2 + n) throw new Error('invalid client key DER length');
+    let size = 0;
+    for (const b of der.slice(2, 2+n)) size = size * 256 + b;
+    expected = 2 + n + size;
+  }
+  if (expected !== der.length) throw new Error('invalid client key DER length');
+  return '-----BEGIN ' + algorithm + 'PRIVATE KEY-----\n' +
+    lines.join('\n') + '\n-----END ' + algorithm + 'PRIVATE KEY-----\n';
 }
 
 export function convertOvpn(profile, expectedIp) {
@@ -133,10 +146,11 @@ export function convertOvpn(profile, expectedIp) {
   const rest = restLines.join('\n');
   if (/^\s*<\/?[a-z]/im.test(rest)) throw new Error('unsupported inline block');
   if (blocks.has('cert') !== blocks.has('key')) throw new Error('client identity certificate and key must be paired');
+  let clientCertificate, clientKey;
   if (blocks.has('cert')) {
     try {
-      validateCerts(blocks.get('cert'));
-      validateClientKey(blocks.get('key'));
+      clientCertificate = validateCerts(blocks.get('cert'));
+      clientKey = validateClientKey(blocks.get('key'));
     } catch {
       throw new Error('invalid client identity certificate or key');
     }
@@ -162,6 +176,10 @@ export function convertOvpn(profile, expectedIp) {
   if (!['udp','udp4','tcp','tcp-client','tcp4','tcp4-client'].includes(protocol)) throw new Error('unsupported protocol');
   if (!blocks.has('ca')) throw new Error('inline CA required');
   const tls = {certificate: validateCerts(blocks.get('ca')), remote_certificate_tls:'server'};
+  if (clientCertificate) {
+    tls.client_certificate = clientCertificate;
+    tls.client_key = [clientKey];
+  }
   const certName = one(directives, 'verify-x509-name');
   if (certName) {
     if (certName.length < 1 || certName.length > 2 || !/^[A-Za-z0-9_.-]{1,256}$/.test(certName[0]) ||

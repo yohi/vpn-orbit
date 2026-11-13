@@ -10,6 +10,7 @@ const REFRESH_ERROR_CODES = new Set([
   'CATALOG_BODY_MISSING','CATALOG_ENCODING_INVALID','CATALOG_INVALID',
   'INSUFFICIENT_COMPATIBLE_SERVERS','GROUP_SELECTION_FAILED',
   'PROFILE_BUILD_FAILED','PROFILE_TOO_LARGE','SNAPSHOT_WRITE_FAILED',
+  'CLIENT_KEY_PUBLICATION_NOT_ALLOWED',
 ]);
 
 class RefreshError extends Error {
@@ -94,6 +95,12 @@ export async function refreshProfile(env, fetchFn=fetch, now=Date.now()) {
   } catch (error) {
     throw new RefreshError('PROFILE_BUILD_FAILED','profile generation failed',{cause:error});
   }
+  // An unauthenticated profile URL may expose a published VPN Gate dummy key.
+  // Require an explicit operator opt-in before persisting/distributing it.
+  if (endpoint.tls?.client_key?.length && env.ALLOW_PUBLIC_CLIENT_KEYS !== 'true') {
+    throw new RefreshError('CLIENT_KEY_PUBLICATION_NOT_ALLOWED',
+      'public distribution of embedded client keys requires explicit opt-in');
+  }
   const profile = JSON.stringify(config);
   if (profile.length > MAX_PROFILE_JSON) throw new RefreshError('PROFILE_TOO_LARGE','generated profile too large');
   const snapshot = JSON.stringify({updatedAt:now,profile});
@@ -106,7 +113,7 @@ export async function refreshProfile(env, fetchFn=fetch, now=Date.now()) {
   return {updatedAt:now,selectedCount:selected.length};
 }
 
-function readSnapshot(raw,now,approved) {
+function readSnapshot(raw,now,approved,allowPublicClientKeys=false) {
   if (!raw || raw.length > MAX_PROFILE_JSON + 1000) return null;
   try {
     const s = JSON.parse(raw);
@@ -118,6 +125,9 @@ function readSnapshot(raw,now,approved) {
         !Array.isArray(cfg.endpoints[0].servers) || cfg.endpoints[0].servers.length < 2 ||
         cfg.route?.final !== 'vpn-gate' || !cfg.endpoints[0].block_ipv6 || cfg.outbounds?.length) return null;
     if (cfg.endpoints[0].servers.some(server => !isPublicIPv4(server.server) || !approved.has(server.server))) return null;
+    const tls = cfg.endpoints[0].tls;
+    if (Boolean(tls?.client_certificate?.length) !== Boolean(tls?.client_key?.length)) return null;
+    if (tls?.client_key?.length && !allowPublicClientKeys) return null;
     return s;
   } catch { return null; }
 }
@@ -129,7 +139,8 @@ export async function handleRequest(request, env, now=Date.now()) {
   if (!env?.PROFILE_KV?.get) return response('Not configured',503);
   const approved = new Set((env.APPROVED_IPS || '').split(/[\s,]+/).filter(Boolean));
   if (approved.size < 2 || [...approved].some(ip=>!isPublicIPv4(ip))) return response('No current approved profile',503);
-  const snapshot = readSnapshot(await env.PROFILE_KV.get(SNAPSHOT_KEY),now,approved);
+  const snapshot = readSnapshot(await env.PROFILE_KV.get(SNAPSHOT_KEY),now,approved,
+    env.ALLOW_PUBLIC_CLIENT_KEYS === 'true');
   if (!snapshot) return response('No current approved profile',503);
   if (url.pathname === '/health') return response(JSON.stringify({status:'ready',ageSeconds:Math.floor((now-snapshot.updatedAt)/1000),
     servers:JSON.parse(snapshot.profile).endpoints[0].servers.length}),200,{'Content-Type':'application/json; charset=utf-8'});

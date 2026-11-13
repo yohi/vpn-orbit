@@ -35,13 +35,14 @@ test('OpenVPN profile generates independently verified CA and no unsafe directiv
   assert.ok(e.tls.certificate[0].includes('BEGIN CERTIFICATE'));
   assert.equal(buildConfig(e).route.final,'vpn-gate');
 });
-test('SoftEther dummy client identity blocks are validated and omitted from the endpoint',()=>{
+test('SoftEther inline client identity is preserved for sing-box',()=>{
   const clientCert=cert;
-  const clientKey='-----BEGIN RSA PRIVATE KEY-----\nMCEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\n-----END RSA PRIVATE KEY-----';
+  const encodedKey=Buffer.concat([Buffer.from([0x30,0x1e]),Buffer.alloc(30,1)]).toString('base64');
+  const clientKey='-----BEGIN RSA PRIVATE KEY-----\n'+encodedKey+'\n-----END RSA PRIVATE KEY-----';
   const profile=ovpn(ipA).replace('</ca>',`</ca>\n<cert>\n${clientCert}</cert>\n<key>\n${clientKey}\n</key>`);
   const endpoint=convertOvpn(profile,ipA);
-  assert.equal(endpoint.tls.client_certificate,undefined);
-  assert.equal(JSON.stringify(endpoint).includes('RSA PRIVATE KEY'),false);
+  assert.equal(endpoint.tls.client_certificate.length,1);
+  assert.equal(endpoint.tls.client_key[0],clientKey+'\n');
   assert.equal(parseCatalog(csv(row(ipA,profile)),new Set([ipA,ipB])).length,1);
 });
 test('client identity blocks must be paired and contain valid PEM encoding',()=>{
@@ -49,6 +50,36 @@ test('client identity blocks must be paired and contain valid PEM encoding',()=>
   const malformed=ovpn(ipA).replace('</ca>',`</ca>\n<cert>\nnot a certificate\n</cert>\n<key>\nnot a key\n</key>`);
   assert.throws(()=>convertOvpn(certOnly,ipA),/client identity/);
   assert.throws(()=>convertOvpn(malformed,ipA),/client identity/);
+});
+test('publication of a client private key requires an explicit Worker opt-in',async()=>{
+  const encodedKey=Buffer.concat([Buffer.from([0x30,0x1e]),Buffer.alloc(30,1)]).toString('base64');
+  const identity='<cert>\n'+cert+'</cert>\n<key>\n-----BEGIN RSA PRIVATE KEY-----\n'+
+    encodedKey+'\n-----END RSA PRIVATE KEY-----\n</key>\n';
+  const first=ovpn(ipA,{control:identity});
+  const second=ovpn(ipB,{control:identity});
+  const e=env();
+  await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(row(ipA,first),row(ipB,second))),t0),
+    /explicit opt-in/);
+  assert.equal(e.writes.length,0);
+  e.ALLOW_PUBLIC_CLIENT_KEYS='true';
+  await refreshProfile(e,fakeFetch(csv(row(ipA,first),row(ipB,second))),t0);
+  const res=await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000);
+  assert.equal(res.status,200);
+  assert.equal((await res.json()).endpoints[0].tls.client_key.length,1);
+  e.ALLOW_PUBLIC_CLIENT_KEYS='false';
+  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000)).status,503);
+});
+test('different embedded client keys are never grouped as one OpenVPN endpoint',()=>{
+  const makeKey=n=>'-----BEGIN RSA PRIVATE KEY-----\n'+
+    Buffer.concat([Buffer.from([0x30,0x1e]),Buffer.alloc(30,n)]).toString('base64')+
+    '\n-----END RSA PRIVATE KEY-----\n';
+  const wrap=k=>'<cert>\n'+cert+'</cert>\n<key>\n'+k+'</key>\n';
+  const candidates=parseCatalog(csv(
+    row(ipA,ovpn(ipA,{control:wrap(makeKey(1))})),
+    row(ipB,ovpn(ipB,{control:wrap(makeKey(2))}))
+  ),new Set([ipA,ipB]));
+  assert.equal(candidates.length,2);
+  assert.throws(()=>selectGroup(candidates),/fewer than two/);
 });
 test('remote-cert-eku is rejected as an unsupported directive',()=>{
   assert.throws(()=>convertOvpn(ovpn(ipA,{script:'remote-cert-eku \\ TLS Web Server Authentication'}),ipA),/unsupported directive: remote-cert-eku/);

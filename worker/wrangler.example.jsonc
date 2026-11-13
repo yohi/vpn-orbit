@@ -10,6 +10,8 @@
     // Comma-separated, user-verified Tokyo-tested ingress (remote) IPs.
     // Must have at least 2 and be explicitly approved; do not auto-trust JP.
     "APPROVED_IPS": "REPLACE_WITH_TWO_OR_MORE_VERIFIED_PUBLIC_IPS",
-    "MAX_SERVERS": "5"
+    "MAX_SERVERS": "5",
+    // DENY by default. Explicitly accept public exposure of a dummy key first.
+    "ALLOW_PUBLIC_CLIENT_KEYS": "false"
   }
 }

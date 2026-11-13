@@ -137,13 +137,42 @@ def _static_key(contents: str) -> str:
     return body + "\n"
 
 
+def _client_key_pem(contents: str) -> str:
+    """Parse an unencrypted client key PEM. Does not verify cryptographic pairing."""
+    raw = contents.strip().replace("\r\n", "\n")
+    match = re.fullmatch(
+        r"-----BEGIN (RSA PRIVATE KEY|EC PRIVATE KEY|PRIVATE KEY)-----\s+"
+        r"([A-Za-z0-9+/=\s]+?)\s+-----END \1-----",
+        raw, re.S,
+    )
+    if not match:
+        raise UnsupportedProfile("invalid or encrypted client private key PEM")
+    try:
+        der = base64.b64decode("".join(match.group(2).split()), validate=True)
+    except ValueError as exc:
+        raise UnsupportedProfile("invalid client private key encoding") from exc
+    if len(der) < 32 or der[0] != 0x30:
+        raise UnsupportedProfile("invalid client private key DER")
+    length = der[1]
+    if length < 0x80:
+        total = 2 + length
+    else:
+        length_bytes = length & 0x7F
+        if not 1 <= length_bytes <= 4 or len(der) < 2 + length_bytes:
+            raise UnsupportedProfile("invalid client private key DER length")
+        total = 2 + length_bytes + int.from_bytes(der[2:2 + length_bytes], "big")
+    if total != len(der):
+        raise UnsupportedProfile("invalid client private key DER length")
+    return raw + "\n"
+
+
 def convert_ovpn(profile: str, *, expected_ip: str | None = None) -> dict:
     if len(profile.encode("utf-8")) > MAX_PROFILE:
         raise UnsupportedProfile("OpenVPN profile exceeds size limit")
     blocks: dict[str, str] = {}
     def pull_block(m: re.Match) -> str:
         name = m.group(1).lower()
-        if name in blocks or name not in {"ca", "tls-auth", "tls-crypt"}:
+        if name in blocks or name not in {"ca", "tls-auth", "tls-crypt", "cert", "key"}:
             raise UnsupportedProfile(f"unsupported/duplicate inline block: {name}")
         blocks[name] = m.group(2)
         return "\n"
@@ -212,6 +241,11 @@ def convert_ovpn(profile: str, *, expected_ip: str | None = None) -> dict:
         }
     else:
         tls = {"certificate": [_ca_pem(blocks["ca"])], "remote_certificate_tls": "server"}
+    if ("cert" in blocks) != ("key" in blocks):
+        raise UnsupportedProfile("inline client certificate and key must be paired")
+    if "cert" in blocks:
+        tls["client_certificate"] = [_ca_pem(blocks["cert"])]
+        tls["client_key"] = [_client_key_pem(blocks["key"])]
     cert_name = _one(directives, "verify-x509-name")
     if cert_name is not None:
         if not 1 <= len(cert_name) <= 2 or len(cert_name[0]) > 256:

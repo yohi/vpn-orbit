@@ -131,6 +131,37 @@ class Phase1Tests(unittest.TestCase):
         with self.assertRaises(UnsupportedProfile):
             convert_ovpn(profile)
 
+    def test_inline_client_identity_preserved(self):
+        # Synthetic DER-shaped key only: no real private credential is committed.
+        der = b"\x30\x1e" + b"\x01" * 30
+        key = ("-----BEGIN RSA PRIVATE KEY-----\n"
+               + base64.b64encode(der).decode() + "\n-----END RSA PRIVATE KEY-----\n")
+        profile = PROFILE + f"<cert>\n{CA}</cert>\n<key>\n{key}</key>\n"
+        endpoint = convert_ovpn(profile)
+        self.assertEqual(endpoint["tls"]["client_certificate"], [CA.strip() + "\n"])
+        self.assertEqual(endpoint["tls"]["client_key"], [key])
+        self.assertEqual(build_config(endpoint)["endpoints"][0]["tls"]["client_key"], [key])
+
+    def test_inline_client_identity_fails_closed_on_invalid_input(self):
+        der = b"\x30\x1e" + b"\x01" * 30
+        key = ("-----BEGIN RSA PRIVATE KEY-----\n"
+               + base64.b64encode(der).decode() + "\n-----END RSA PRIVATE KEY-----\n")
+        cert_block = f"<cert>\n{CA}</cert>\n"
+        key_block = f"<key>\n{key}</key>\n"
+        bad = (
+            PROFILE + cert_block,
+            PROFILE + key_block,
+            PROFILE + cert_block + key_block + cert_block,
+            PROFILE + cert_block + key_block.replace("RSA PRIVATE KEY", "ENCRYPTED PRIVATE KEY"),
+            PROFILE + cert_block + key_block.replace(base64.b64encode(der).decode(), "invalid!"),
+            PROFILE + cert_block + key_block.replace(
+                base64.b64encode(der).decode(),
+                base64.b64encode(b"\x30\x21" + b"\x01" * 30).decode()),
+        )
+        for input_profile in bad:
+            with self.subTest(length=len(input_profile)), self.assertRaises(UnsupportedProfile):
+                convert_ovpn(input_profile)
+
     def test_tls_auth_inline(self):
         key = '-----BEGIN OpenVPN Static key V1-----\n' + ('a' * 64 + '\n') * 8 + '-----END OpenVPN Static key V1-----'
         profile = PROFILE + '<tls-auth>\n' + key + '\n</tls-auth>\nkey-direction 1\n'

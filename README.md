@@ -68,6 +68,12 @@ Phase 1の実機テストは [docs/phase1-ios.md](docs/phase1-ios.md) を参照�
 - https://sing-box.sagernet.org/configuration/inbound/tun/
 - https://sing-box.sagernet.org/configuration/route/
 
+## Inline OpenVPN client identity (2026-11-13)
+
+VPN Gate/SoftEtherの.ovpnに含まれる`<cert>`/`<key>`をPhase 1とPhase 3で安全に解析し、sing-boxの`tls.client_certificate`/`tls.client_key`へ引き継ぎます。片方だけのペア、不正・暗号化PEMは拒否します。**PEM構造検査は証明書と鍵の暗号学的な一致や実機接続成功を証明しません。** Phase 2では異なるクライアントIDを同一Endpointへ結合しません。
+
+Workerの`/profile.json`は認証なしの公開URLです。クライアント秘密鍵を含む設定は`ALLOW_PUBLIC_CLIENT_KEYS="true"`を明示しない限り公開しません。この設定を有効化すると鍵をKV・公開JSONへ出力するため、**公開済みダミー鍵だとHuman Ownerが確認した場合だけ**承認してください。個人用認証情報には使用しないでください。詳細: [Phase 3](docs/phase3-workers.md)。
+
 ## Phase 3 — Cloudflare Workers / remote profile distribution
 
 Phase 3 builds on Phase 2, adding a Cloudflare Worker that periodically fetches VPN Gate's JP catalog and serves a sing-box MT profile at `GET /profile.json`. It selects only operator-approved Tokyo-tested ingress IPs sharing identical CA and TLS settings, requires at least two distinct remotes, and never emits a direct fallback. An expired profile returns HTTP 503; **this does not revoke a profile already cached on iOS**.
