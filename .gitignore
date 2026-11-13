@@ -11,3 +11,5 @@ __pycache__/
 worker/wrangler.jsonc
 # Preserve the package manifest despite the generic *.json ignore
 !worker/package.json
+worker/.dev.vars*
+worker/.env*
