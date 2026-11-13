@@ -1,11 +1,40 @@
 import {API_URL,MAX_CATALOG_BYTES,isPublicIPv4,parseCatalog,selectGroup,buildConfig} from './catalog.mjs';
 
+
+/* Human-approved remote identity: IP + port + transport verified on iPhone. */
+export function parseApprovedRemotes(raw) {
+  if (typeof raw!=='string') throw Error('APPROVED_REMOTES requires 2-20 entries');
+  const items=raw.split(/[\s,]+/).filter(Boolean);
+  if (items.length<2 || items.length>20) throw Error('APPROVED_REMOTES requires 2-20 entries');
+  const pins=new Map();
+  for (const item of items) {
+    const m=/^((?:\d{1,3}\.){3}\d{1,3}):([1-9]\d{0,4})\/(tcp|udp)$/.exec(item);
+    if (!m || !isPublicIPv4(m[1])) throw Error('invalid approved remote');
+    const port=Number(m[2]);
+    if (port>65535 || pins.has(m[1])) throw Error('duplicate or invalid approved remote');
+    pins.set(m[1],{port,network:m[3]});
+  }
+  return pins;
+}
+const validToken=t=>typeof t==='string' && /^[a-fA-F0-9]{64}$/.test(t);
+function authorized(request,secret) {
+  const url=new URL(request.url), tokens=url.searchParams.getAll('token');
+  const header=request.headers.get('Authorization');
+  if (tokens.length>1 || (header && tokens.length)) return false;
+  const m=header && /^Bearer ([a-fA-F0-9]{64})$/.exec(header);
+  const supplied=tokens.length?tokens[0]:m?.[1];
+  if (!validToken(supplied)) return false;
+  let diff=0;
+  for(let i=0;i<64;i++) diff|=secret.charCodeAt(i)^supplied.charCodeAt(i);
+  return diff===0;
+}
+
 const SNAPSHOT_KEY = 'profile-v1';
 const MAX_AGE_MS = 2 * 60 * 60 * 1000; // Serve nothing if last refresh is older than 2h.
 const MAX_PROFILE_JSON = 512 * 1024;
 const PROBE_TIMEOUT_MS = 14000;
 const REFRESH_ERROR_CODES = new Set([
-  'PROFILE_KV_MISSING','APPROVED_IPS_INVALID','MAX_SERVERS_INVALID',
+  'PROFILE_KV_MISSING','APPROVED_REMOTES_INVALID','PROFILE_TOKEN_MISSING','MAX_SERVERS_INVALID',
   'API_FETCH_FAILED','API_RESPONSE_INVALID','CATALOG_TOO_LARGE',
   'CATALOG_BODY_MISSING','CATALOG_ENCODING_INVALID','CATALOG_INVALID',
   'INSUFFICIENT_COMPATIBLE_SERVERS','GROUP_SELECTION_FAILED',
@@ -27,13 +56,16 @@ function refreshErrorCode(error) {
 }
 
 function response(message,status,headers={}) {
-  return new Response(message,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers}});
+  return new Response(message,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Robots-Tag':'noindex, nofollow',...headers}});
 }
 
 export async function refreshProfile(env, fetchFn=fetch, now=Date.now()) {
   if (!env?.PROFILE_KV?.put) throw new RefreshError('PROFILE_KV_MISSING','PROFILE_KV is required');
-  const approved = new Set((env.APPROVED_IPS || '').split(/[\s,]+/).filter(Boolean));
-  if (approved.size < 2 || [...approved].some(ip=>!isPublicIPv4(ip))) throw new RefreshError('APPROVED_IPS_INVALID','APPROVED_IPS requires at least 2 valid public IPv4 addresses');
+  if (!validToken(env.PROFILE_ACCESS_TOKEN)) throw new RefreshError('PROFILE_TOKEN_MISSING','profile token required');
+  let pins;
+  try {pins=parseApprovedRemotes(env.APPROVED_REMOTES);}
+  catch(error) {throw new RefreshError('APPROVED_REMOTES_INVALID','invalid approved remote identities',{cause:error});}
+  const approved=new Set(pins.keys());
   const count = env.MAX_SERVERS === undefined ? 5 : Number(env.MAX_SERVERS);
   if (!Number.isInteger(count) || count < 2 || count > 20) throw new RefreshError('MAX_SERVERS_INVALID','MAX_SERVERS must be 2-20');
   const controller = new AbortController();
@@ -73,7 +105,10 @@ export async function refreshProfile(env, fetchFn=fetch, now=Date.now()) {
   } finally { clearTimeout(timeout); }
   let candidates;
   try {
-    candidates = parseCatalog(csv,approved);
+    candidates = parseCatalog(csv,approved).filter(c=>{
+      const pin=pins.get(c.ip);
+      return pin && pin.port===c.endpoint.server_port && pin.network===c.endpoint.network;
+    });
   } catch (error) {
     throw new RefreshError('CATALOG_INVALID','catalog could not be parsed',{cause:error});
   }
@@ -113,7 +148,7 @@ export async function refreshProfile(env, fetchFn=fetch, now=Date.now()) {
   return {updatedAt:now,selectedCount:selected.length};
 }
 
-function readSnapshot(raw,now,approved,allowPublicClientKeys=false) {
+function readSnapshot(raw,now,pins,allowPublicClientKeys=false) {
   if (!raw || raw.length > MAX_PROFILE_JSON + 1000) return null;
   try {
     const s = JSON.parse(raw);
@@ -124,7 +159,10 @@ function readSnapshot(raw,now,approved,allowPublicClientKeys=false) {
     if (cfg?.endpoints?.length !== 1 || cfg.endpoints[0].type !== 'openvpn-client' ||
         !Array.isArray(cfg.endpoints[0].servers) || cfg.endpoints[0].servers.length < 2 ||
         cfg.route?.final !== 'vpn-gate' || !cfg.endpoints[0].block_ipv6 || cfg.outbounds?.length) return null;
-    if (cfg.endpoints[0].servers.some(server => !isPublicIPv4(server.server) || !approved.has(server.server))) return null;
+    if (cfg.endpoints[0].servers.some(server=>{
+      const pin=pins.get(server.server);
+      return !pin || pin.port!==server.server_port || pin.network!==server.network;
+    })) return null;
     // Never serve a profile that routes its own VPN transport back into the TUN.
     const tun = cfg.inbounds?.length === 1 ? cfg.inbounds[0] : null;
     const excluded = cfg.endpoints[0].servers.map(remote => remote.server + '/32');
@@ -145,10 +183,11 @@ export async function handleRequest(request, env, now=Date.now()) {
   const url = new URL(request.url);
   if (request.method !== 'GET') return response('Method Not Allowed',405,{Allow:'GET'});
   if (url.pathname !== '/profile.json' && url.pathname !== '/health') return response('Not Found',404);
-  if (!env?.PROFILE_KV?.get) return response('Not configured',503);
-  const approved = new Set((env.APPROVED_IPS || '').split(/[\s,]+/).filter(Boolean));
-  if (approved.size < 2 || [...approved].some(ip=>!isPublicIPv4(ip))) return response('No current approved profile',503);
-  const snapshot = readSnapshot(await env.PROFILE_KV.get(SNAPSHOT_KEY),now,approved,
+  if (!env?.PROFILE_KV?.get || !validToken(env?.PROFILE_ACCESS_TOKEN)) return response('Not configured',503);
+  if (!authorized(request,env.PROFILE_ACCESS_TOKEN)) return response('Unauthorized',401);
+  let pins;
+  try {pins=parseApprovedRemotes(env.APPROVED_REMOTES);} catch {return response('No current approved profile',503);}
+  const snapshot=readSnapshot(await env.PROFILE_KV.get(SNAPSHOT_KEY),now,pins,
     env.ALLOW_PUBLIC_CLIENT_KEYS === 'true');
   if (!snapshot) return response('No current approved profile',503);
   if (url.pathname === '/health') return response(JSON.stringify({status:'ready',ageSeconds:Math.floor((now-snapshot.updatedAt)/1000),
