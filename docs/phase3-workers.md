@@ -55,3 +55,61 @@ The config template intentionally contains nonfunctional placeholders and does *
 - sing-box 1.14 OpenVPN Endpoint: https://sing-box.sagernet.org/configuration/endpoint/openvpn-client/
 - Cloudflare Cron: https://developers.cloudflare.com/workers/configuration/cron-triggers/
 - Workers KV consistency: https://developers.cloudflare.com/kv/concepts/how-kv-works/
+
+## 2026-11-13 — Phase 3 current deployment gate (supersedes earlier untested status)
+
+The user tested both `119.105.93.237:1279/tcp` and
+`126.234.242.57:1281/tcp` on iPhone: both have Tokyo egress. The Phase 2
+combined profile and first-remote-failed automatic retry succeeded; Wi-Fi->4G
+restored the tunnel and Tokyo IPv4 without taps. DNS test found only Cloudflare
+resolvers, no public IPv6 was observed while connected. Mid-session server
+outage failover and leak-free network transition remain **NOT VERIFIED**.
+
+This Worker now requires `APPROVED_REMOTES` with exact IP, port, transport.
+A port change is rejected: renewed iPhone verification is mandatory.
+This is *refresh of approved identities*, not auto-promotion of new Tokyo IPs.
+`GET /profile.json` and `GET /health` require a 64-hex
+`PROFILE_ACCESS_TOKEN` Cloudflare Secret, sent as a Bearer header or
+`?token=` (iOS Remote Profile URL, treat as sensitive).
+
+| Type | Name | Required value |
+|---|---|---|
+| Workers KV | `PROFILE_KV` | New namespace ID |
+| Variable | `APPROVED_REMOTES` | `119.105.93.237:1279/tcp,126.234.242.57:1281/tcp` |
+| Variable | `MAX_SERVERS` | `2` |
+| Variable | `ALLOW_PUBLIC_CLIENT_KEYS` | `false` until public/test-only client key is verified |
+| Secret | `PROFILE_ACCESS_TOKEN` | Locally generated via `openssl rand -hex 32`, never shared |
+
+Operator-run commands (NOT run by the code-writing assistant):
+
+```bash
+cd ~/program/private/vpn-orbit/worker
+npm test
+cp wrangler.example.jsonc wrangler.jsonc
+npx wrangler@latest login
+npx wrangler@latest kv namespace create PROFILE_KV
+# Set returned KV id in ignored wrangler.jsonc.
+openssl rand -hex 32
+npx wrangler@latest secret put PROFILE_ACCESS_TOKEN
+# After inspecting VPN Gate client-key classification and explicit approval:
+npx wrangler@latest deploy
+```
+
+`wrangler secret put` may deploy a Worker version immediately. This is why
+cloud commands and the explicit client-key distribution decision are separate.
+If VPN Gate rows contain an inline client private key, the existing
+`ALLOW_PUBLIC_CLIENT_KEYS=false` gate refuses to persist or serve the profile.
+Do not override this for private/personal identity material. A protected URL
+can still leak if shared, logged or included in screenshots.
+
+Authenticated test after a successful Cron (initially HTTP 503 until refreshed):
+
+```bash
+read -rsp 'Token: ' VPN_ORBIT_TOKEN; echo
+curl --fail-with-body -H "Authorization: Bearer ${VPN_ORBIT_TOKEN}" \
+  'https://<YOUR-WORKER>.workers.dev/health'
+unset VPN_ORBIT_TOKEN
+```
+
+No Cloudflare resource is created by the GitHub changes.
+Remote Profile refresh in sing-box MT is still not runtime-verified.
