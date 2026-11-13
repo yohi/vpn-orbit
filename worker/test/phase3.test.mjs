@@ -195,7 +195,8 @@ test('stale or tampered route exclusions fail closed on public profile read',asy
 });
 test('unapproved or single approved IP cannot trigger publication',async()=>{
   const e=env(ipA);
-  await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0),/APPROVED_REMOTES/);
+  await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0),
+    error=>error.code==='APPROVED_REMOTES_INVALID');
   assert.equal(e.writes.length,0);
 });
 test('scheduled refresh logs fixed failure codes without exception details',async()=>{
