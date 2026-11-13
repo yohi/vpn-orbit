@@ -2,11 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {convertOvpn,parseCatalog,selectGroup,buildConfig,isPublicIPv4,parseCsvLine} from '../src/catalog.mjs';
-import worker,{refreshProfile,handleRequest} from '../src/index.mjs';
+import worker,{refreshProfile,handleRequest,parseApprovedRemotes} from '../src/index.mjs';
 const fixture = (name)=>readFileSync(new URL(`./fixtures/${name}`,import.meta.url),'utf8');
 const cert = fixture('a.pem');
 const cert2 = fixture('b.pem');
 const ipA = '8.8.8.8', ipB = '9.9.9.9', ipC = '1.1.1.1';
+const accessToken='b'.repeat(64);
+const req=(p,o={})=>new Request('https://example.com'+p,{...o,headers:{Authorization:'Bearer '+accessToken,...o.headers}});
 function ovpn(ip,{ca=cert,script='',control='',auth=''}={}) {
   return `client\nproto udp\nremote ${ip} 1195\ncipher AES-128-CBC\nauth SHA1\nremote-cert-tls server\n${auth}\n<ca>\n${ca}</ca>\n${control}\n${script}`;
 }
@@ -15,7 +17,7 @@ const row = (ip,p=ovpn(ip),country='JP',ping=10)=>`test.opengw.net,${ip},100,${p
 const csv = (...rows)=> '*vpn_servers\n#HostName,IP,Score,Ping,Speed,CountryShort,OpenVPN_ConfigData_Base64\n'+rows.join('\n');
 function env(approved='8.8.8.8,9.9.9.9') {
   const values=new Map(); const writes=[];
-  return {APPROVED_IPS:approved,MAX_SERVERS:'5',PROFILE_KV:{
+  return {APPROVED_REMOTES:approved.split(',').map(ip=>ip+':1195/udp').join(','),PROFILE_ACCESS_TOKEN:accessToken,MAX_SERVERS:'5',PROFILE_KV:{
     get:async key=>values.get(key)||null,
     put:async (key,value)=>{writes.push(value);values.set(key,value);}
   }, values,writes};
@@ -68,11 +70,11 @@ test('publication of a client private key requires an explicit Worker opt-in',as
   assert.equal(e.writes.length,0);
   e.ALLOW_PUBLIC_CLIENT_KEYS='true';
   await refreshProfile(e,fakeFetch(csv(row(ipA,first),row(ipB,second))),t0);
-  const res=await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000);
+  const res=await handleRequest(req('/profile.json'),e,t0+1000);
   assert.equal(res.status,200);
   assert.equal((await res.json()).endpoints[0].tls.client_key.length,1);
   e.ALLOW_PUBLIC_CLIENT_KEYS='false';
-  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000)).status,503);
+  assert.equal((await handleRequest(req('/profile.json'),e,t0+1000)).status,503);
 });
 test('different embedded client keys are never grouped as one OpenVPN endpoint',()=>{
   const makeKey=n=>'-----BEGIN RSA PRIVATE KEY-----\n'+
@@ -155,14 +157,14 @@ test('cron refresh publishes fresh validated config without leaking candidates i
   const result=await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
   assert.equal(result.selectedCount,2);
   assert.equal(e.writes.length,1);
-  const res=await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000);
+  const res=await handleRequest(req('/profile.json'),e,t0+1000);
   assert.equal(res.status,200);
   assert.equal(res.headers.get('cache-control'),'no-store');
   const profile=await res.json();
   assert.deepEqual(profile.endpoints[0].servers.map(x=>x.server),[ipA,ipB]);
   assert.deepEqual(profile.inbounds[0].route_exclude_address,[ipA+'/32',ipB+'/32']);
   assert.equal(Object.hasOwn(profile.inbounds[0],'route_address'),false);
-  const health=await handleRequest(new Request('https://example.com/health'),e,t0+1000);
+  const health=await handleRequest(req('/health'),e,t0+1000);
   assert.equal(health.status,200);
   assert.deepEqual(await health.json(),{status:'ready',ageSeconds:1,servers:2});
 });
@@ -186,14 +188,14 @@ test('stale or tampered route exclusions fail closed on public profile read',asy
     mutation(cfg);
     snapshot.profile=JSON.stringify(cfg);
     e.values.set('profile-v1',JSON.stringify(snapshot));
-    assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000)).status,503);
+    assert.equal((await handleRequest(req('/profile.json'),e,t0+1000)).status,503);
   }
   e.values.set('profile-v1',original);
-  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000)).status,200);
+  assert.equal((await handleRequest(req('/profile.json'),e,t0+1000)).status,200);
 });
 test('unapproved or single approved IP cannot trigger publication',async()=>{
   const e=env(ipA);
-  await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0),/APPROVED_IPS/);
+  await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0),/APPROVED_REMOTES/);
   assert.equal(e.writes.length,0);
 });
 test('scheduled refresh logs fixed failure codes without exception details',async()=>{
@@ -207,7 +209,7 @@ test('scheduled refresh logs fixed failure codes without exception details',asyn
   } finally {
     console.error=originalError;
   }
-  assert.deepEqual(logged,[['Profile refresh failed:','APPROVED_IPS_INVALID']]);
+  assert.deepEqual(logged,[['Profile refresh failed:','APPROVED_REMOTES_INVALID']]);
 });
 test('scheduled refresh identifies insufficient compatible servers without profile details',async()=>{
   const originalError=console.error;
@@ -246,33 +248,33 @@ test('API outage does not erase last valid record, but stale record is not serve
   await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
   await assert.rejects(()=>refreshProfile(e,fakeFetch('unavailable',502),t0+60000));
   assert.equal(e.writes.length,1);
-  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+120000)).status,200);
-  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+7200001)).status,503);
+  assert.equal((await handleRequest(req('/profile.json'),e,t0+120000)).status,200);
+  assert.equal((await handleRequest(req('/profile.json'),e,t0+7200001)).status,503);
 });
 test('no KV snapshot = fail-closed (503); no direct fallback; only GET',async()=>{
   const e=env();
-  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0)).status,503);
-  assert.equal((await handleRequest(new Request('https://example.com/profile.json',{method:'POST'}),e,t0)).status,405);
-  assert.equal((await handleRequest(new Request('https://example.com/admin'),e,t0)).status,404);
+  assert.equal((await handleRequest(req('/profile.json'),e,t0)).status,503);
+  assert.equal((await handleRequest(req('/profile.json',{method:'POST'}),e,t0)).status,405);
+  assert.equal((await handleRequest(req('/admin'),e,t0)).status,404);
 });
 test('malformed KV snapshot never served',async()=>{
   const e=env();e.values.set('profile-v1','{"bad":true}');
-  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0)).status,503);
+  assert.equal((await handleRequest(req('/profile.json'),e,t0)).status,503);
 });
 test('snapshot containing an IP removed from current approvals is not served',async()=>{
   const e=env();
   await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
-  e.APPROVED_IPS=ipA;
+  e.APPROVED_REMOTES=ipA+':1195/udp';
 
-  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000)).status,503);
-  assert.equal((await handleRequest(new Request('https://example.com/health'),e,t0+1000)).status,503);
+  assert.equal((await handleRequest(req('/profile.json'),e,t0+1000)).status,503);
+  assert.equal((await handleRequest(req('/health'),e,t0+1000)).status,503);
 });
 test('snapshot is served when every remote remains currently approved',async()=>{
   const e=env();
   await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
-  e.APPROVED_IPS=`${ipA},${ipB},${ipC}`;
+  e.APPROVED_REMOTES=`${ipA}:1195/udp,${ipB}:1195/udp,${ipC}:1195/udp`;
 
-  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000)).status,200);
+  assert.equal((await handleRequest(req('/profile.json'),e,t0+1000)).status,200);
 });
 test('less than two compatible approved remotes never replaced last good snapshot',async()=>{
   const e=env();
@@ -301,4 +303,33 @@ test('catalog stream exceeding the byte limit is cancelled before publication',a
   await assert.rejects(()=>refreshProfile(e,fetchOversized,t0),/catalog too large/);
   assert.equal(chunks,2);
   assert.equal(e.writes.length,0);
+});
+
+test('pin parser rejects invalid, duplicate or private entries',()=>{
+  assert.equal(parseApprovedRemotes(ipA+':1195/udp,'+ipB+':1195/udp').size,2);
+  for(const pins of [ipA+':1195/udp',ipA+':1195/udp,'+ipA+':1195/udp',
+     ipA+':0/udp,'+ipB+':1195/udp',ipA+':65536/udp,'+ipB+':1195/udp',
+     '192.168.1.1:1195/udp,'+ipB+':1195/udp',ipA+':1195/other,'+ipB+':1195/udp'])
+     assert.throws(()=>parseApprovedRemotes(pins));
+});
+test('changed transport and port fail closed both on refresh and read',async()=>{
+  const e=env();
+  e.APPROVED_REMOTES=ipA+':1195/udp,'+ipB+':443/tcp';
+  await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0),/fewer than two/);
+  assert.equal(e.writes.length,0);
+  e.APPROVED_REMOTES=ipA+':1195/udp,'+ipB+':1195/udp';
+  await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
+  e.APPROVED_REMOTES=ipA+':443/tcp,'+ipB+':1195/udp';
+  assert.equal((await handleRequest(req('/profile.json'),e,t0+1000)).status,503);
+});
+test('private access token is required on both endpoints',async()=>{
+  const e=env();
+  await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
+  assert.equal((await handleRequest(new Request('https://example.com/profile.json'),e,t0+1000)).status,401);
+  assert.equal((await handleRequest(new Request('https://example.com/health'),e,t0+1000)).status,401);
+  assert.equal((await handleRequest(new Request('https://example.com/profile.json?token='+accessToken),e,t0+1000)).status,200);
+  assert.equal((await handleRequest(new Request('https://example.com/profile.json?token=wrong'),e,t0+1000)).status,401);
+  delete e.PROFILE_ACCESS_TOKEN;
+  assert.equal((await handleRequest(req('/profile.json'),e,t0+1000)).status,503);
+  await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0+2000),/profile token required/);
 });
