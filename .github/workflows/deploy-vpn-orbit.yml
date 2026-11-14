@@ -43,6 +43,7 @@ jobs:
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_KV_NAMESPACE_ID: ${{ vars.CLOUDFLARE_KV_NAMESPACE_ID }}
+          APPROVED_IDENTITY_SHA256: ${{ vars.APPROVED_IDENTITY_SHA256 }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           PROFILE_ACCESS_TOKEN: ${{ secrets.PROFILE_ACCESS_TOKEN }}
         shell: bash
@@ -56,6 +57,16 @@ jobs:
             echo "::error::Set Actions Variable CLOUDFLARE_KV_NAMESPACE_ID (32 hex chars)"
             exit 1
           fi
+          if [[ -z "$APPROVED_IDENTITY_SHA256" ]]; then
+            echo "::error::Set Actions Variable APPROVED_IDENTITY_SHA256 from previously verified iPhone JSON"
+            exit 1
+          fi
+          node --input-type=module <<'NODE'
+          import {parseApprovedRemotes} from './worker/src/index.mjs';
+          import {parseIdentityApprovals} from './worker/src/identity.mjs';
+          const pins=parseApprovedRemotes('119.105.93.237:1279/tcp,126.234.242.57:1281/tcp');
+          parseIdentityApprovals(process.env.APPROVED_IDENTITY_SHA256,pins);
+          NODE
           if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
             echo "::error::Set Actions Secret CLOUDFLARE_API_TOKEN"
             exit 1
@@ -70,6 +81,7 @@ jobs:
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_KV_NAMESPACE_ID: ${{ vars.CLOUDFLARE_KV_NAMESPACE_ID }}
+          APPROVED_IDENTITY_SHA256: ${{ vars.APPROVED_IDENTITY_SHA256 }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           PROFILE_ACCESS_TOKEN: ${{ secrets.PROFILE_ACCESS_TOKEN }}
         shell: bash
@@ -94,6 +106,7 @@ jobs:
             throw new Error('Unreviewed Worker deployment configuration');
           }
           config.kv_namespaces[0].id = process.env.CLOUDFLARE_KV_NAMESPACE_ID;
+          config.vars.APPROVED_IDENTITY_SHA256 = process.env.APPROVED_IDENTITY_SHA256;
           // Approved only for the verified VPN Gate public shared test key.
           config.vars.ALLOW_PUBLIC_CLIENT_KEYS = 'true';
           fs.writeFileSync('wrangler.jsonc', JSON.stringify(config, null, 2) + '\n', {mode: 0o600});

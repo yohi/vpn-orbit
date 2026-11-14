@@ -221,8 +221,9 @@ export function convertOvpn(profile, expectedIp) {
   return endpoint;
 }
 
-export function parseCatalog(csv, approvedIps) {
+export function parseCatalog(csv, approvedIps, remotePins=null, keepApprovedDuplicates=false) {
   if (!(approvedIps instanceof Set) || approvedIps.size < 2 || [...approvedIps].some(ip=>!isPublicIPv4(ip))) throw new Error('at least two valid approved IPv4s required');
+  if (remotePins !== null && !(remotePins instanceof Map)) throw new Error('invalid remote pin map');
   if (new TextEncoder().encode(csv).length > MAX_CATALOG_BYTES) throw new Error('catalog too large');
   const lines = csv.replace(/^\uFEFF/,'').split(/\r?\n/);
   const pos = lines.findIndex(s=>s.startsWith('#HostName,') || s.startsWith('HostName,'));
@@ -238,16 +239,22 @@ export function parseCatalog(csv, approvedIps) {
       const cells = parseCsvLine(line);
       if (cells.length !== keys.length) continue;
       const row = Object.fromEntries(keys.map((k,i)=>[k,cells[i]]));
-      if (row.CountryShort.toUpperCase() !== 'JP' || !approvedIps.has(row.IP) || seen.has(row.IP)) continue;
+      if (row.CountryShort.toUpperCase() !== 'JP' || !approvedIps.has(row.IP)) continue;
       if (row.OpenVPN_ConfigData_Base64.length > MAX_PROFILE_BYTES * 2) continue;
       const raw = decodeBase64(row.OpenVPN_ConfigData_Base64);
       const profile = new TextDecoder('utf-8',{fatal:true}).decode(raw);
       const endpoint = convertOvpn(profile, row.IP);
+      // Reject an unapproved port/transport before consuming this IP's dedup slot.
+      if (remotePins) {
+        const pin=remotePins.get(row.IP);
+        if (!pin || pin.port!==endpoint.server_port || pin.network!==endpoint.network) continue;
+      }
+      if (!keepApprovedDuplicates && seen.has(row.IP)) continue;
       results.push({ip:row.IP,hostname:row.HostName,endpoint,
         ping:Number.isFinite(+row.Ping)?+row.Ping:9999,
         speed:Number.isFinite(+row.Speed)?+row.Speed:0,
         score:Number.isFinite(+row.Score)?+row.Score:0});
-      seen.add(row.IP);
+      if (!keepApprovedDuplicates) seen.add(row.IP);
     } catch { /* Untrusted volunteer server profile rejected, never relaxed. */ }
   }
   results.sort((a,b)=>(a.ping>0?a.ping:9999)-(b.ping>0?b.ping:9999) || b.speed-a.speed || b.score-a.score || a.ip.localeCompare(b.ip));

@@ -1,4 +1,5 @@
 import {API_URL,MAX_CATALOG_BYTES,isPublicIPv4,parseCatalog,selectGroup,buildConfig} from './catalog.mjs';
+import {sharedIdentitySha256,parseIdentityApprovals} from './identity.mjs';
 
 
 /* Human-approved remote identity: IP + port + transport verified on iPhone. */
@@ -34,7 +35,7 @@ const MAX_AGE_MS = 2 * 60 * 60 * 1000; // Serve nothing if last refresh is older
 const MAX_PROFILE_JSON = 512 * 1024;
 const PROBE_TIMEOUT_MS = 14000;
 const REFRESH_ERROR_CODES = new Set([
-  'PROFILE_KV_MISSING','APPROVED_REMOTES_INVALID','PROFILE_TOKEN_MISSING','MAX_SERVERS_INVALID',
+  'PROFILE_KV_MISSING','APPROVED_REMOTES_INVALID','APPROVED_IDENTITIES_INVALID','PROFILE_TOKEN_MISSING','MAX_SERVERS_INVALID',
   'API_FETCH_FAILED','API_RESPONSE_INVALID','CATALOG_TOO_LARGE',
   'CATALOG_BODY_MISSING','CATALOG_ENCODING_INVALID','CATALOG_INVALID',
   'INSUFFICIENT_COMPATIBLE_SERVERS','GROUP_SELECTION_FAILED',
@@ -65,6 +66,9 @@ export async function refreshProfile(env, fetchFn=fetch, now=Date.now()) {
   let pins;
   try {pins=parseApprovedRemotes(env.APPROVED_REMOTES);}
   catch(error) {throw new RefreshError('APPROVED_REMOTES_INVALID','invalid approved remote identities',{cause:error});}
+  let approvedIdentities;
+  try {approvedIdentities=parseIdentityApprovals(env.APPROVED_IDENTITY_SHA256,pins);}
+  catch(error) {throw new RefreshError('APPROVED_IDENTITIES_INVALID','missing or invalid approved identities',{cause:error});}
   const approved=new Set(pins.keys());
   const count = env.MAX_SERVERS === undefined ? 5 : Number(env.MAX_SERVERS);
   if (!Number.isInteger(count) || count < 2 || count > 20) throw new RefreshError('MAX_SERVERS_INVALID','MAX_SERVERS must be 2-20');
@@ -105,10 +109,16 @@ export async function refreshProfile(env, fetchFn=fetch, now=Date.now()) {
   } finally { clearTimeout(timeout); }
   let candidates;
   try {
-    candidates = parseCatalog(csv,approved).filter(c=>{
-      const pin=pins.get(c.ip);
-      return pin && pin.port===c.endpoint.server_port && pin.network===c.endpoint.network;
-    });
+    // Keep duplicate approved transports until identity verification completes.
+    // An unapproved earlier TLS profile must not reserve an IP against a later valid row.
+    candidates=[];
+    const acceptedIps=new Set();
+    for (const c of parseCatalog(csv,approved,pins,true)) {
+      if (acceptedIps.has(c.ip)) continue;
+      if (await sharedIdentitySha256(c.endpoint) !== approvedIdentities.get(c.ip)) continue;
+      candidates.push(c);
+      acceptedIps.add(c.ip);
+    }
   } catch (error) {
     throw new RefreshError('CATALOG_INVALID','catalog could not be parsed',{cause:error});
   }
@@ -130,11 +140,11 @@ export async function refreshProfile(env, fetchFn=fetch, now=Date.now()) {
   } catch (error) {
     throw new RefreshError('PROFILE_BUILD_FAILED','profile generation failed',{cause:error});
   }
-  // An unauthenticated profile URL may expose a published VPN Gate dummy key.
-  // Require an explicit operator opt-in before persisting/distributing it.
+  // Only operator-verified, already public shared test keys may be distributed.
+  // An independent access token is required to retrieve the profile.
   if (endpoint.tls?.client_key?.length && env.ALLOW_PUBLIC_CLIENT_KEYS !== 'true') {
     throw new RefreshError('CLIENT_KEY_PUBLICATION_NOT_ALLOWED',
-      'public distribution of embedded client keys requires explicit opt-in');
+      'distribution of embedded client keys requires explicit opt-in');
   }
   const profile = JSON.stringify(config);
   if (profile.length > MAX_PROFILE_JSON) throw new RefreshError('PROFILE_TOO_LARGE','generated profile too large');
@@ -148,7 +158,7 @@ export async function refreshProfile(env, fetchFn=fetch, now=Date.now()) {
   return {updatedAt:now,selectedCount:selected.length};
 }
 
-function readSnapshot(raw,now,pins,allowPublicClientKeys=false) {
+async function readSnapshot(raw,now,pins,approvedIdentities,allowPublicClientKeys=false) {
   if (!raw || raw.length > MAX_PROFILE_JSON + 1000) return null;
   try {
     const s = JSON.parse(raw);
@@ -163,6 +173,9 @@ function readSnapshot(raw,now,pins,allowPublicClientKeys=false) {
       const pin=pins.get(server.server);
       return !pin || pin.port!==server.server_port || pin.network!==server.network;
     })) return null;
+    // Revalidate the stored snapshot against CURRENT operator-approved identity pins.
+    const storedIdentity=await sharedIdentitySha256(cfg.endpoints[0]);
+    if (cfg.endpoints[0].servers.some(server=>approvedIdentities.get(server.server)!==storedIdentity)) return null;
     // Never serve a profile that routes its own VPN transport back into the TUN.
     const tun = cfg.inbounds?.length === 1 ? cfg.inbounds[0] : null;
     const excluded = cfg.endpoints[0].servers.map(remote => remote.server + '/32');
@@ -187,7 +200,10 @@ export async function handleRequest(request, env, now=Date.now()) {
   if (!authorized(request,env.PROFILE_ACCESS_TOKEN)) return response('Unauthorized',401);
   let pins;
   try {pins=parseApprovedRemotes(env.APPROVED_REMOTES);} catch {return response('No current approved profile',503);}
-  const snapshot=readSnapshot(await env.PROFILE_KV.get(SNAPSHOT_KEY),now,pins,
+  let approvedIdentities;
+  try {approvedIdentities=parseIdentityApprovals(env.APPROVED_IDENTITY_SHA256,pins);}
+  catch {return response('No current approved profile',503);}
+  const snapshot=await readSnapshot(await env.PROFILE_KV.get(SNAPSHOT_KEY),now,pins,approvedIdentities,
     env.ALLOW_PUBLIC_CLIENT_KEYS === 'true');
   if (!snapshot) return response('No current approved profile',503);
   if (url.pathname === '/health') return response(JSON.stringify({status:'ready',ageSeconds:Math.floor((now-snapshot.updatedAt)/1000),

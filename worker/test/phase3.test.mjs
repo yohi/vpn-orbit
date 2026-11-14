@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {convertOvpn,parseCatalog,selectGroup,buildConfig,isPublicIPv4,parseCsvLine} from '../src/catalog.mjs';
 import worker,{refreshProfile,handleRequest,parseApprovedRemotes} from '../src/index.mjs';
+import {sharedIdentitySha256,parseIdentityApprovals} from '../src/identity.mjs';
 const fixture = (name)=>readFileSync(new URL(`./fixtures/${name}`,import.meta.url),'utf8');
 const cert = fixture('a.pem');
 const cert2 = fixture('b.pem');
@@ -15,9 +16,13 @@ function ovpn(ip,{ca=cert,script='',control='',auth=''}={}) {
 const encoded = text => Buffer.from(text).toString('base64');
 const row = (ip,p=ovpn(ip),country='JP',ping=10)=>`test.opengw.net,${ip},100,${ping},25000000,${country},${encoded(p)}`;
 const csv = (...rows)=> '*vpn_servers\n#HostName,IP,Score,Ping,Speed,CountryShort,OpenVPN_ConfigData_Base64\n'+rows.join('\n');
+const baseDigest=await sharedIdentitySha256(convertOvpn(ovpn(ipA),ipA));
+const identityPins=(remotes,digest=baseDigest)=>remotes.split(',').map(remote=>remote+'='+digest).join(',');
 function env(approved='8.8.8.8,9.9.9.9') {
   const values=new Map(); const writes=[];
-  return {APPROVED_REMOTES:approved.split(',').map(ip=>ip+':1195/udp').join(','),PROFILE_ACCESS_TOKEN:accessToken,MAX_SERVERS:'5',PROFILE_KV:{
+  const approvedRemotes=approved.split(',').map(ip=>ip+':1195/udp').join(',');
+  return {APPROVED_REMOTES:approvedRemotes,APPROVED_IDENTITY_SHA256:identityPins(approvedRemotes),
+    PROFILE_ACCESS_TOKEN:accessToken,MAX_SERVERS:'5',PROFILE_KV:{
     get:async key=>values.get(key)||null,
     put:async (key,value)=>{writes.push(value);values.set(key,value);}
   }, values,writes};
@@ -65,6 +70,9 @@ test('publication of a client private key requires an explicit Worker opt-in',as
   const first=ovpn(ipA,{control:identity});
   const second=ovpn(ipB,{control:identity});
   const e=env();
+  // Test opt-in against a separately approved public-test client identity.
+  const approvedDigest=await sharedIdentitySha256(convertOvpn(first,ipA));
+  e.APPROVED_IDENTITY_SHA256=identityPins(e.APPROVED_REMOTES,approvedDigest);
   await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(row(ipA,first),row(ipB,second))),t0),
     /explicit opt-in/);
   assert.equal(e.writes.length,0);
@@ -73,6 +81,13 @@ test('publication of a client private key requires an explicit Worker opt-in',as
   const res=await handleRequest(req('/profile.json'),e,t0+1000);
   assert.equal(res.status,200);
   assert.equal((await res.json()).endpoints[0].tls.client_key.length,1);
+  const original=e.values.get('profile-v1');
+  const changed=JSON.parse(original),changedConfig=JSON.parse(changed.profile);
+  changedConfig.endpoints[0].tls.client_key[0]+='MODIFIED';
+  changed.profile=JSON.stringify(changedConfig);
+  e.values.set('profile-v1',JSON.stringify(changed));
+  assert.equal((await handleRequest(req('/profile.json'),e,t0+1000)).status,503);
+  e.values.set('profile-v1',original);
   e.ALLOW_PUBLIC_CLIENT_KEYS='false';
   assert.equal((await handleRequest(req('/profile.json'),e,t0+1000)).status,503);
 });
@@ -274,6 +289,7 @@ test('snapshot is served when every remote remains currently approved',async()=>
   const e=env();
   await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
   e.APPROVED_REMOTES=`${ipA}:1195/udp,${ipB}:1195/udp,${ipC}:1195/udp`;
+  e.APPROVED_IDENTITY_SHA256=identityPins(e.APPROVED_REMOTES);
 
   assert.equal((await handleRequest(req('/profile.json'),e,t0+1000)).status,200);
 });
@@ -316,11 +332,14 @@ test('pin parser rejects invalid, duplicate or private entries',()=>{
 test('changed transport and port fail closed both on refresh and read',async()=>{
   const e=env();
   e.APPROVED_REMOTES=ipA+':1195/udp,'+ipB+':443/tcp';
+  e.APPROVED_IDENTITY_SHA256=identityPins(e.APPROVED_REMOTES);
   await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0),/fewer than two/);
   assert.equal(e.writes.length,0);
   e.APPROVED_REMOTES=ipA+':1195/udp,'+ipB+':1195/udp';
+  e.APPROVED_IDENTITY_SHA256=identityPins(e.APPROVED_REMOTES);
   await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
   e.APPROVED_REMOTES=ipA+':443/tcp,'+ipB+':1195/udp';
+  e.APPROVED_IDENTITY_SHA256=identityPins(e.APPROVED_REMOTES);
   assert.equal((await handleRequest(req('/profile.json'),e,t0+1000)).status,503);
 });
 test('private access token is required on both endpoints',async()=>{
@@ -333,4 +352,60 @@ test('private access token is required on both endpoints',async()=>{
   delete e.PROFILE_ACCESS_TOKEN;
   assert.equal((await handleRequest(req('/profile.json'),e,t0+1000)).status,503);
   await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0+2000),/profile token required/);
+});
+
+test('approved port/transport is checked before deduplicating an IP',async()=>{
+  const remotePins=new Map([[ipA,{port:1195,network:'udp'}],[ipB,{port:1195,network:'udp'}]]);
+  const firstUnapproved=ovpn(ipA).replace('remote '+ipA+' 1195','remote '+ipA+' 443');
+  const data=csv(row(ipA,firstUnapproved),row(ipA),row(ipB));
+  assert.deepEqual(parseCatalog(data,new Set([ipA,ipB]),remotePins).map(c=>c.ip),[ipA,ipB]);
+  const e=env();
+  const result=await refreshProfile(e,fakeFetch(data),t0);
+  assert.equal(result.selectedCount,2);
+  assert.equal(e.writes.length,1);
+});
+test('identity mismatch does not occupy IP and later approved profile survives',async()=>{
+  const bad=ovpn(ipA,{ca:cert2});
+  const e=env();
+  const result=await refreshProfile(e,fakeFetch(csv(row(ipA,bad),row(ipA),row(ipB))),t0);
+  assert.equal(result.selectedCount,2);
+  assert.equal(e.writes.length,1);
+});
+test('matching each other is not enough: changed CA is rejected before KV write',async()=>{
+  const e=env();
+  await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(
+    row(ipA,ovpn(ipA,{ca:cert2})),row(ipB,ovpn(ipB,{ca:cert2}))
+  )),t0),/fewer than two compatible/);
+  assert.equal(e.writes.length,0);
+});
+test('stored profile with changed TLS is rejected on read',async()=>{
+  const e=env();
+  await refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0);
+  const snapshot=JSON.parse(e.values.get('profile-v1'));
+  const cfg=JSON.parse(snapshot.profile);
+  cfg.endpoints[0].tls.certificate[0]=cert2;
+  snapshot.profile=JSON.stringify(cfg);
+  e.values.set('profile-v1',JSON.stringify(snapshot));
+  assert.equal((await handleRequest(req('/profile.json'),e,t0+1000)).status,503);
+});
+test('missing or malformed identity approvals fail closed',async()=>{
+  const e=env();
+  delete e.APPROVED_IDENTITY_SHA256;
+  await assert.rejects(()=>refreshProfile(e,fakeFetch(csv(row(ipA),row(ipB))),t0),
+    error=>error.code==='APPROVED_IDENTITIES_INVALID');
+  assert.equal(e.writes.length,0);
+  assert.equal((await handleRequest(req('/profile.json'),e,t0)).status,503);
+  e.APPROVED_IDENTITY_SHA256=identityPins(e.APPROVED_REMOTES).replace(baseDigest,'0'.repeat(64));
+  assert.equal((await handleRequest(req('/health'),e,t0)).status,503);
+  assert.throws(()=>parseIdentityApprovals(ipA+':1195/udp='+baseDigest,new Map([
+    [ipA,{port:1195,network:'udp'}],[ipB,{port:1195,network:'udp'}]
+  ])));
+});
+test('fingerprint is independent of remote array and property ordering but includes client identity',async()=>{
+  const first=convertOvpn(ovpn(ipA),ipA);
+  const second={...first,servers:[{server:ipA,server_port:1195,network:'udp'}]};
+  delete second.server;delete second.server_port;delete second.network;
+  assert.equal(await sharedIdentitySha256(first),await sharedIdentitySha256(second));
+  second.tls={...second.tls,client_key:['private-test-value'],client_certificate:['test-cert']};
+  assert.notEqual(await sharedIdentitySha256(first),await sharedIdentitySha256(second));
 });
