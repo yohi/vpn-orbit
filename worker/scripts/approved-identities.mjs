@@ -1,17 +1,25 @@
 #!/usr/bin/env node
 /**
  * Run locally ONLY against the previously verified iPhone merged JSON.
+ * Reads only ~/Downloads/vpn-orbit-tokyo-phase2-119-126.json.
  * Prints one GitHub Actions Variable value; no certificates or private keys.
  */
-import {readFileSync} from 'node:fs';
+import {readFileSync,lstatSync} from 'node:fs';
+import {homedir} from 'node:os';
+import {join} from 'node:path';
 import {sharedIdentitySha256} from '../src/identity.mjs';
 
-const sourcePath=process.argv[2];
-if (!sourcePath || process.argv.length!==3) {
-  console.error('Usage: node scripts/approved-identities.mjs /path/to/verified-phase2.json');
+// Always read the operator's previously verified file, not an arbitrary CLI path.
+const sourcePath=join(homedir(),'Downloads','vpn-orbit-tokyo-phase2-119-126.json');
+if (process.argv.length!==2) {
+  console.error('Usage: node scripts/approved-identities.mjs (reads the fixed verified profile in ~/Downloads)');
   process.exitCode=2;
 } else {
   try {
+    const file=lstatSync(sourcePath);
+    if (!file.isFile() || file.isSymbolicLink() || file.size>512*1024) {
+      throw new Error('unsafe verified profile file');
+    }
     const cfg=JSON.parse(readFileSync(sourcePath,'utf8'));
     const ep=cfg?.endpoints?.length===1 ? cfg.endpoints[0] : null;
     const expected=new Map([

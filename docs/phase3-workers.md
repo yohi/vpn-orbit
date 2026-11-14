@@ -86,10 +86,11 @@ Local preparation only (no Cloudflare deployment from this shell):
 ```bash
 cd ~/program/private/vpn-orbit/worker
 npm test
-node scripts/approved-identities.mjs ~/Downloads/vpn-orbit-tokyo-phase2-119-126.json
+node scripts/approved-identities.mjs
 ```
 
 Use **only the previously iPhone-verified** Phase 2 combined JSON. The script
+reads only `~/Downloads/vpn-orbit-tokyo-phase2-119-126.json` (a regular, non-symlink file) and
 prints `APPROVED_IDENTITY_SHA256=<IP:port/network=sha256,...>` without showing
 the inline private key; register the value after `=` in the GitHub Actions
 Variable `APPROVED_IDENTITY_SHA256`. The SHA-256 covers shared TLS trust,
@@ -97,6 +98,8 @@ control-wrap, client certificate/key and authentication settings, not the
 IP/port/protocol (those are pinned independently in `APPROVED_REMOTES`).
 An incorrect, missing or stale approval blocks new KV writes and delivery.
 Never generate a fingerprint from a fresh **unverified** VPN Gate download.
+The helper intentionally takes no CLI path. Keep the verified combined JSON
+at that exact location; do not rename or replace it with an unverified file.
 
 The Human Owner separately confirmed the VPN Gate client's shared key
 was publicly downloadable from the official API, and approved authenticated
@@ -131,7 +134,7 @@ Under **Repository Settings > Secrets and variables > Actions**, add:
 | Secret | `PROFILE_ACCESS_TOKEN` | 64 hex characters from `openssl rand -hex 32`; keep a private local copy for iOS |
 | Variable | `CLOUDFLARE_ACCOUNT_ID` | 32-character Cloudflare account ID |
 | Variable | `CLOUDFLARE_KV_NAMESPACE_ID` | `8c2f963fe91f48b493d068d0a0fb7493` |
-| Variable | `APPROVED_IDENTITY_SHA256` | Output value of `node worker/scripts/approved-identities.mjs /path/to/verified-phase2.json` (omit `APPROVED_IDENTITY_SHA256=` prefix) |
+| Variable | `APPROVED_IDENTITY_SHA256` | Output value of `cd worker && node scripts/approved-identities.mjs` (omit `APPROVED_IDENTITY_SHA256=` prefix) |
 
 The existing KV namespace is **reused** (even if renamed to
 `vpn-orbit-tokyo-profiles`); the Worker binding stays `PROFILE_KV`.

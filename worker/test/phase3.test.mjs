@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readFileSync} from 'node:fs';
+import {readFileSync,writeFileSync,mkdirSync,mkdtempSync,rmSync} from 'node:fs';
+import {spawnSync} from 'node:child_process';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {convertOvpn,parseCatalog,selectGroup,buildConfig,isPublicIPv4,parseCsvLine} from '../src/catalog.mjs';
 import worker,{refreshProfile,handleRequest,parseApprovedRemotes} from '../src/index.mjs';
 import {sharedIdentitySha256,parseIdentityApprovals} from '../src/identity.mjs';
@@ -408,4 +412,35 @@ test('fingerprint is independent of remote array and property ordering but inclu
   assert.equal(await sharedIdentitySha256(first),await sharedIdentitySha256(second));
   second.tls={...second.tls,client_key:['private-test-value'],client_certificate:['test-cert']};
   assert.notEqual(await sharedIdentitySha256(first),await sharedIdentitySha256(second));
+});
+
+test('approval CLI uses the fixed verified file and rejects arbitrary path arguments',()=>{
+  const tmp=mkdtempSync(join(tmpdir(),'vpn-orbit-verified-'));
+  try {
+    const downloads=join(tmp,'Downloads');
+    mkdirSync(downloads);
+    const endpoint=convertOvpn(ovpn(ipA),ipA);
+    delete endpoint.server;
+    delete endpoint.server_port;
+    delete endpoint.network;
+    endpoint.servers=[
+      {server:'119.105.93.237',server_port:1279,network:'tcp'},
+      {server:'126.234.242.57',server_port:1281,network:'tcp'}
+    ];
+    const profile=buildConfig(endpoint);
+    writeFileSync(join(downloads,'vpn-orbit-tokyo-phase2-119-126.json'),JSON.stringify(profile),{mode:0o600});
+    const executable=fileURLToPath(new URL('../scripts/approved-identities.mjs',import.meta.url));
+    const env={...process.env,HOME:tmp};
+    const valid=spawnSync(process.execPath,[executable],{env,encoding:'utf8'});
+    assert.equal(valid.status,0,valid.stderr);
+    assert.equal(valid.stdout.trim(),
+      'APPROVED_IDENTITY_SHA256=119.105.93.237:1279/tcp='+baseDigest+
+      ',126.234.242.57:1281/tcp='+baseDigest);
+    const forbidden=spawnSync(process.execPath,[executable,'../../etc/passwd'],{env,encoding:'utf8'});
+    assert.equal(forbidden.status,2);
+    assert.equal(forbidden.stdout,'');
+    assert.equal(forbidden.stderr.includes('BEGIN'),false);
+  } finally {
+    rmSync(tmp,{recursive:true,force:true});
+  }
 });

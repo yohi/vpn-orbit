@@ -12,7 +12,7 @@ function canonical(value) {
   if (value && typeof value === 'object') {
     const proto = Object.getPrototypeOf(value);
     if (proto !== Object.prototype && proto !== null) throw new Error('unsupported identity object');
-    return '{' + Object.keys(value).sort().map(k=>JSON.stringify(k)+':'+canonical(value[k])).join(',') + '}';
+    return '{' + Object.keys(value).sort((a,b)=>a.localeCompare(b,'en-US')).map(k=>JSON.stringify(k)+':'+canonical(value[k])).join(',') + '}';
   }
   throw new Error('unsupported identity value');
 }
