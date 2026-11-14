@@ -112,6 +112,19 @@ function validateClientKey(body) {
   const lines = pemBody(trimmed, `-----BEGIN ${algorithm}PRIVATE KEY-----`, `-----END ${algorithm}PRIVATE KEY-----`, /^[A-Za-z0-9+/]+={0,2}$/, 2048);
   const der = decodeBase64(lines.join(''));
   if (der.length < 32 || der[0] !== 0x30) throw new Error('invalid client identity key');
+  const length = der[1];
+  let expected;
+  if (length < 0x80) expected = 2 + length;
+  else {
+    const n = length & 0x7f;
+    if (n < 1 || n > 4 || der.length < 2 + n) throw new Error('invalid client key DER length');
+    let size = 0;
+    for (const b of der.slice(2, 2+n)) size = size * 256 + b;
+    expected = 2 + n + size;
+  }
+  if (expected !== der.length) throw new Error('invalid client key DER length');
+  return '-----BEGIN ' + algorithm + 'PRIVATE KEY-----\n' +
+    lines.join('\n') + '\n-----END ' + algorithm + 'PRIVATE KEY-----\n';
 }
 
 export function convertOvpn(profile, expectedIp) {
@@ -133,10 +146,11 @@ export function convertOvpn(profile, expectedIp) {
   const rest = restLines.join('\n');
   if (/^\s*<\/?[a-z]/im.test(rest)) throw new Error('unsupported inline block');
   if (blocks.has('cert') !== blocks.has('key')) throw new Error('client identity certificate and key must be paired');
+  let clientCertificate, clientKey;
   if (blocks.has('cert')) {
     try {
-      validateCerts(blocks.get('cert'));
-      validateClientKey(blocks.get('key'));
+      clientCertificate = validateCerts(blocks.get('cert'));
+      clientKey = validateClientKey(blocks.get('key'));
     } catch {
       throw new Error('invalid client identity certificate or key');
     }
@@ -162,6 +176,10 @@ export function convertOvpn(profile, expectedIp) {
   if (!['udp','udp4','tcp','tcp-client','tcp4','tcp4-client'].includes(protocol)) throw new Error('unsupported protocol');
   if (!blocks.has('ca')) throw new Error('inline CA required');
   const tls = {certificate: validateCerts(blocks.get('ca')), remote_certificate_tls:'server'};
+  if (clientCertificate) {
+    tls.client_certificate = clientCertificate;
+    tls.client_key = [clientKey];
+  }
   const certName = one(directives, 'verify-x509-name');
   if (certName) {
     if (certName.length < 1 || certName.length > 2 || !/^[A-Za-z0-9_.-]{1,256}$/.test(certName[0]) ||
@@ -203,8 +221,9 @@ export function convertOvpn(profile, expectedIp) {
   return endpoint;
 }
 
-export function parseCatalog(csv, approvedIps) {
+export function parseCatalog(csv, approvedIps, remotePins=null, keepApprovedDuplicates=false) {
   if (!(approvedIps instanceof Set) || approvedIps.size < 2 || [...approvedIps].some(ip=>!isPublicIPv4(ip))) throw new Error('at least two valid approved IPv4s required');
+  if (remotePins !== null && !(remotePins instanceof Map)) throw new Error('invalid remote pin map');
   if (new TextEncoder().encode(csv).length > MAX_CATALOG_BYTES) throw new Error('catalog too large');
   const lines = csv.replace(/^\uFEFF/,'').split(/\r?\n/);
   const pos = lines.findIndex(s=>s.startsWith('#HostName,') || s.startsWith('HostName,'));
@@ -220,16 +239,22 @@ export function parseCatalog(csv, approvedIps) {
       const cells = parseCsvLine(line);
       if (cells.length !== keys.length) continue;
       const row = Object.fromEntries(keys.map((k,i)=>[k,cells[i]]));
-      if (row.CountryShort.toUpperCase() !== 'JP' || !approvedIps.has(row.IP) || seen.has(row.IP)) continue;
+      if (row.CountryShort.toUpperCase() !== 'JP' || !approvedIps.has(row.IP)) continue;
       if (row.OpenVPN_ConfigData_Base64.length > MAX_PROFILE_BYTES * 2) continue;
       const raw = decodeBase64(row.OpenVPN_ConfigData_Base64);
       const profile = new TextDecoder('utf-8',{fatal:true}).decode(raw);
       const endpoint = convertOvpn(profile, row.IP);
+      // Reject an unapproved port/transport before consuming this IP's dedup slot.
+      if (remotePins) {
+        const pin=remotePins.get(row.IP);
+        if (!pin || pin.port!==endpoint.server_port || pin.network!==endpoint.network) continue;
+      }
+      if (!keepApprovedDuplicates && seen.has(row.IP)) continue;
       results.push({ip:row.IP,hostname:row.HostName,endpoint,
         ping:Number.isFinite(+row.Ping)?+row.Ping:9999,
         speed:Number.isFinite(+row.Speed)?+row.Speed:0,
         score:Number.isFinite(+row.Score)?+row.Score:0});
-      seen.add(row.IP);
+      if (!keepApprovedDuplicates) seen.add(row.IP);
     } catch { /* Untrusted volunteer server profile rejected, never relaxed. */ }
   }
   results.sort((a,b)=>(a.ping>0?a.ping:9999)-(b.ping>0?b.ping:9999) || b.speed-a.speed || b.score-a.score || a.ip.localeCompare(b.ip));
@@ -260,10 +285,21 @@ export function selectGroup(candidates, maxServers=5) {
 }
 
 export function buildConfig(endpoint) {
+  if (!endpoint || endpoint.type !== 'openvpn-client') throw new Error('expected OpenVPN client endpoint');
+  const single=Object.hasOwn(endpoint,'server'), multi=Object.hasOwn(endpoint,'servers');
+  if (single === multi) throw new Error('exactly one OpenVPN remote form is required');
+  const remotes=single ? [endpoint] : endpoint.servers;
+  if (!Array.isArray(remotes) || !remotes.length || remotes.some(item=>!item || !isPublicIPv4(item.server))) {
+    throw new Error('invalid OpenVPN remote list');
+  }
+  const ips=remotes.map(item=>item.server);
+  if (new Set(ips).size !== ips.length) throw new Error('duplicate OpenVPN server IP');
   return {
     log:{level:'warn'},
     dns:{servers:[{type:'udp',tag:'vpn-dns',server:'1.1.1.1',server_port:53,detour:'vpn-gate'}],final:'vpn-dns'},
-    inbounds:[{type:'tun',tag:'tun-in',address:['172.28.250.1/30'],auto_route:true,dns_mode:'hijack',mtu:1400}],
+    // No explicit route_address: iOS default-interface discovery failed with split default routes.
+    inbounds:[{type:'tun',tag:'tun-in',address:['172.28.250.1/30','fd28:250::1/126'],
+      auto_route:true,route_exclude_address:ips.map(ip=>ip+'/32'),dns_mode:'hijack',mtu:1400}],
     endpoints:[endpoint],
     route:{rules:[{protocol:'dns',action:'hijack-dns'}],final:'vpn-gate'}
   };

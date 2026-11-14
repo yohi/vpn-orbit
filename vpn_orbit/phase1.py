@@ -137,13 +137,42 @@ def _static_key(contents: str) -> str:
     return body + "\n"
 
 
+def _client_key_pem(contents: str) -> str:
+    """Parse an unencrypted client key PEM. Does not verify cryptographic pairing."""
+    raw = contents.strip().replace("\r\n", "\n")
+    match = re.fullmatch(
+        r"-----BEGIN (RSA PRIVATE KEY|EC PRIVATE KEY|PRIVATE KEY)-----\s+"
+        r"([A-Za-z0-9+/=\s]+?)\s+-----END \1-----",
+        raw, re.S,
+    )
+    if not match:
+        raise UnsupportedProfile("invalid or encrypted client private key PEM")
+    try:
+        der = base64.b64decode("".join(match.group(2).split()), validate=True)
+    except ValueError as exc:
+        raise UnsupportedProfile("invalid client private key encoding") from exc
+    if len(der) < 32 or der[0] != 0x30:
+        raise UnsupportedProfile("invalid client private key DER")
+    length = der[1]
+    if length < 0x80:
+        total = 2 + length
+    else:
+        length_bytes = length & 0x7F
+        if not 1 <= length_bytes <= 4 or len(der) < 2 + length_bytes:
+            raise UnsupportedProfile("invalid client private key DER length")
+        total = 2 + length_bytes + int.from_bytes(der[2:2 + length_bytes], "big")
+    if total != len(der):
+        raise UnsupportedProfile("invalid client private key DER length")
+    return raw + "\n"
+
+
 def convert_ovpn(profile: str, *, expected_ip: str | None = None) -> dict:
     if len(profile.encode("utf-8")) > MAX_PROFILE:
         raise UnsupportedProfile("OpenVPN profile exceeds size limit")
     blocks: dict[str, str] = {}
     def pull_block(m: re.Match) -> str:
         name = m.group(1).lower()
-        if name in blocks or name not in {"ca", "tls-auth", "tls-crypt"}:
+        if name in blocks or name not in {"ca", "tls-auth", "tls-crypt", "cert", "key"}:
             raise UnsupportedProfile(f"unsupported/duplicate inline block: {name}")
         blocks[name] = m.group(2)
         return "\n"
@@ -212,6 +241,11 @@ def convert_ovpn(profile: str, *, expected_ip: str | None = None) -> dict:
         }
     else:
         tls = {"certificate": [_ca_pem(blocks["ca"])], "remote_certificate_tls": "server"}
+    if ("cert" in blocks) != ("key" in blocks):
+        raise UnsupportedProfile("inline client certificate and key must be paired")
+    if "cert" in blocks:
+        tls["client_certificate"] = [_ca_pem(blocks["cert"])]
+        tls["client_key"] = [_client_key_pem(blocks["key"])]
     cert_name = _one(directives, "verify-x509-name")
     if cert_name is not None:
         if not 1 <= len(cert_name) <= 2 or len(cert_name[0]) > 256:
@@ -291,7 +325,22 @@ def convert_ovpn(profile: str, *, expected_ip: str | None = None) -> dict:
 
 
 def build_config(endpoint: dict) -> dict:
-    """Full single-VPN candidate config for a *manual* sing-box MT Phase 1 test."""
+    """Full single- or multi-remote sing-box MT config with explicit server bypass."""
+    if not isinstance(endpoint, dict) or endpoint.get("type") != "openvpn-client":
+        raise UnsupportedProfile("expected OpenVPN client endpoint")
+    single, multi = "server" in endpoint, "servers" in endpoint
+    if single == multi:
+        raise UnsupportedProfile("exactly one OpenVPN remote form is required")
+    remotes = [endpoint] if single else endpoint["servers"]
+    if not isinstance(remotes, list) or not remotes or any(
+        not isinstance(item, dict) or not isinstance(item.get("server"), str)
+        for item in remotes
+    ):
+        raise UnsupportedProfile("invalid OpenVPN remote list")
+    ips = [require_global_ipv4(item["server"]) for item in remotes]
+    if len(ips) != len(set(ips)):
+        raise UnsupportedProfile("duplicate OpenVPN server IP")
+
     return {
         "log": {"level": "warn"},
         "dns": {
@@ -300,8 +349,11 @@ def build_config(endpoint: dict) -> dict:
         },
         "inbounds": [{"type": "tun", "tag": "tun-in",
                       "address": ["172.28.250.1/30", "fd28:250::1/126"],
-                      "inet6_route_address": ["::/1", "8000::/1"],
-                      "auto_route": True, "dns_mode": "hijack", "mtu": 1400}],
+                      "auto_route": True,
+                      # Keep route_address unset: a split default route broke iOS default-interface discovery.
+                      # Bypass only the verified OpenVPN ingress IPs to avoid tunneling the transport.
+                      "route_exclude_address": [f"{ip}/32" for ip in ips],
+                      "dns_mode": "hijack", "mtu": 1400}],
         "endpoints": [endpoint],
         "route": {"rules": [{"protocol": "dns", "action": "hijack-dns"}], "final": "vpn-gate"},
     }

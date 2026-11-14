@@ -1,0 +1,120 @@
+name: VPN Orbit Worker
+
+on:
+  pull_request:
+    paths:
+      - "worker/**"
+      - ".github/workflows/deploy-vpn-orbit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vpn-orbit-worker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test Worker
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run Worker unit tests
+        working-directory: worker
+        run: npm test
+
+  deploy:
+    name: Deploy Cloudflare Worker
+    needs: test
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Validate GitHub Actions configuration
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_KV_NAMESPACE_ID: ${{ vars.CLOUDFLARE_KV_NAMESPACE_ID }}
+          APPROVED_IDENTITY_SHA256: ${{ vars.APPROVED_IDENTITY_SHA256 }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PROFILE_ACCESS_TOKEN: ${{ secrets.PROFILE_ACCESS_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$CLOUDFLARE_ACCOUNT_ID" =~ ^[a-fA-F0-9]{32}$ ]]; then
+            echo "::error::Set Actions Variable CLOUDFLARE_ACCOUNT_ID (32 hex chars)"
+            exit 1
+          fi
+          if [[ ! "$CLOUDFLARE_KV_NAMESPACE_ID" =~ ^[a-fA-F0-9]{32}$ ]]; then
+            echo "::error::Set Actions Variable CLOUDFLARE_KV_NAMESPACE_ID (32 hex chars)"
+            exit 1
+          fi
+          if [[ -z "$APPROVED_IDENTITY_SHA256" ]]; then
+            echo "::error::Set Actions Variable APPROVED_IDENTITY_SHA256 from previously verified iPhone JSON"
+            exit 1
+          fi
+          node --input-type=module <<'NODE'
+          import {parseApprovedRemotes} from './worker/src/index.mjs';
+          import {parseIdentityApprovals} from './worker/src/identity.mjs';
+          const pins=parseApprovedRemotes('119.105.93.237:1279/tcp,126.234.242.57:1281/tcp');
+          parseIdentityApprovals(process.env.APPROVED_IDENTITY_SHA256,pins);
+          NODE
+          if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
+            echo "::error::Set Actions Secret CLOUDFLARE_API_TOKEN"
+            exit 1
+          fi
+          if [[ ! "$PROFILE_ACCESS_TOKEN" =~ ^[a-fA-F0-9]{64}$ ]]; then
+            echo "::error::Set Actions Secret PROFILE_ACCESS_TOKEN (64 hex chars)"
+            exit 1
+          fi
+
+      - name: Deploy Worker with secret in the same version
+        working-directory: worker
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_KV_NAMESPACE_ID: ${{ vars.CLOUDFLARE_KV_NAMESPACE_ID }}
+          APPROVED_IDENTITY_SHA256: ${{ vars.APPROVED_IDENTITY_SHA256 }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PROFILE_ACCESS_TOKEN: ${{ secrets.PROFILE_ACCESS_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          secret_file="$RUNNER_TEMP/vpn-orbit-worker-secrets.json"
+          trap 'rm -f "$secret_file" wrangler.jsonc' EXIT
+
+          node <<'NODE'
+          const fs = require('node:fs');
+          const raw = fs.readFileSync('wrangler.example.jsonc', 'utf8');
+          // The committed example has only full-line JSONC comments.
+          const config = JSON.parse(raw.replace(/^\s*\/\/[^\n]*$/gm, ''));
+          const expected = '119.105.93.237:1279/tcp,126.234.242.57:1281/tcp';
+          if (config.name !== 'vpn-orbit' ||
+              config.kv_namespaces?.length !== 1 ||
+              config.kv_namespaces[0].binding !== 'PROFILE_KV' ||
+              config.vars?.APPROVED_REMOTES !== expected ||
+              config.vars?.MAX_SERVERS !== '2' ||
+              config.secrets?.required?.join(',') !== 'PROFILE_ACCESS_TOKEN') {
+            throw new Error('Unreviewed Worker deployment configuration');
+          }
+          config.kv_namespaces[0].id = process.env.CLOUDFLARE_KV_NAMESPACE_ID;
+          config.vars.APPROVED_IDENTITY_SHA256 = process.env.APPROVED_IDENTITY_SHA256;
+          // Approved only for the verified VPN Gate public shared test key.
+          config.vars.ALLOW_PUBLIC_CLIENT_KEYS = 'true';
+          fs.writeFileSync('wrangler.jsonc', JSON.stringify(config, null, 2) + '\n', {mode: 0o600});
+          fs.writeFileSync(
+            process.env.RUNNER_TEMP + '/vpn-orbit-worker-secrets.json',
+            JSON.stringify({PROFILE_ACCESS_TOKEN: process.env.PROFILE_ACCESS_TOKEN}),
+            {mode: 0o600}
+          );
+          NODE
+
+          npx --yes wrangler@4.161.0 deploy --secrets-file "$secret_file"

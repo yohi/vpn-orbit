@@ -1,3 +1,4 @@
+import base64
 import json
 from pathlib import Path
 import tempfile
@@ -34,6 +35,10 @@ class Phase2Tests(unittest.TestCase):
         config = build_config(endpoint)
         self.assertEqual(config['route']['final'], 'vpn-gate')
         self.assertEqual(config['dns']['servers'][0]['detour'], 'vpn-gate')
+        self.assertEqual(config['inbounds'][0]['route_exclude_address'],
+                         ['8.8.8.8/32', '9.9.9.9/32'])
+        self.assertNotIn('route_address', config['inbounds'][0])
+        self.assertNotIn('inet6_route_address', config['inbounds'][0])
         self.assertNotIn('outbounds', config)
         self.assertFalse(result.ca_union)
 
@@ -54,6 +59,17 @@ class Phase2Tests(unittest.TestCase):
                 ('a', profile(extra='verify-x509-name first name\n')),
                 ('b', profile('9.9.9.9', CA2, extra='verify-x509-name second name\n')),
             ], allow_ca_union=True)
+
+    def test_different_client_identities_not_merged_even_with_ca_union(self):
+        def key(n):
+            der = b"\x30\x1e" + bytes([n]) * 30
+            return ("-----BEGIN RSA PRIVATE KEY-----\n"
+                    + base64.b64encode(der).decode()
+                    + "\n-----END RSA PRIVATE KEY-----\n")
+        a = profile(extra=f"<cert>\n{CA}</cert>\n<key>\n{key(1)}</key>\n")
+        b = profile('9.9.9.9', extra=f"<cert>\n{CA}</cert>\n<key>\n{key(2)}</key>\n")
+        with self.assertRaisesRegex(UnsupportedProfile, "fewer than two compatible"):
+            merge_profiles([('a', a), ('b', b)], allow_ca_union=True)
 
     def test_tls_wrap_difference_skipped(self):
         key = '-----BEGIN OpenVPN Static key V1-----\n' + ('a' * 64 + '\n') * 8 + '-----END OpenVPN Static key V1-----'

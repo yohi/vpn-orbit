@@ -1,5 +1,5 @@
 {
-  // Copy to worker/wrangler.jsonc after you have explicitly approved deployment.
+  // Copy to wrangler.jsonc. Only two iPhone-verified Tokyo IP:port/tcp entries.
   "name": "vpn-orbit",
   "main": "src/index.mjs",
   "compatibility_date": "2026-11-12",
@@ -7,9 +7,10 @@
   "triggers": {"crons": ["*/30 * * * *"]},
   "kv_namespaces": [{"binding": "PROFILE_KV", "id": "REPLACE_WITH_REAL_KV_NAMESPACE_ID"}],
   "vars": {
-    // Comma-separated, user-verified Tokyo-tested ingress (remote) IPs.
-    // Must have at least 2 and be explicitly approved; do not auto-trust JP.
-    "APPROVED_IPS": "REPLACE_WITH_TWO_OR_MORE_VERIFIED_PUBLIC_IPS",
-    "MAX_SERVERS": "5"
-  }
+    "APPROVED_REMOTES": "119.105.93.237:1279/tcp,126.234.242.57:1281/tcp",
+    "APPROVED_IDENTITY_SHA256": "SET_FROM_PREVIOUSLY_VERIFIED_IPHONE_PROFILE",
+    "MAX_SERVERS": "2",
+    "ALLOW_PUBLIC_CLIENT_KEYS": "false"
+  },
+  "secrets": {"required": ["PROFILE_ACCESS_TOKEN"]}
 }

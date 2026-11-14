@@ -42,8 +42,23 @@ class Phase1Tests(unittest.TestCase):
         self.assertEqual(full["route"]["final"], "vpn-gate")
         self.assertNotIn("outbounds", full)
         self.assertEqual(full["dns"]["servers"][0]["detour"], "vpn-gate")
-        self.assertEqual(full["inbounds"][0]["inet6_route_address"], ["::/1", "8000::/1"])
+        self.assertEqual(full["inbounds"][0]["route_exclude_address"], ["8.8.8.8/32"])
+        self.assertNotIn("route_address", full["inbounds"][0])
+        self.assertNotIn("inet6_route_address", full["inbounds"][0])
+        self.assertEqual(full["inbounds"][0]["address"], ["172.28.250.1/30", "fd28:250::1/126"])
         self.assertTrue(endpoint["block_ipv6"])
+
+    def test_route_exclusions_fail_closed_for_invalid_or_ambiguous_remotes(self):
+        endpoint = convert_ovpn(PROFILE)
+        for bad_ip in ("192.168.1.1", "203.0.113.4", "8.8.8.8/32"):
+            with self.subTest(ip=bad_ip), self.assertRaises(UnsupportedProfile):
+                build_config({**endpoint, "server": bad_ip})
+        with self.assertRaises(UnsupportedProfile):
+            build_config({**endpoint, "servers": [{"server": "9.9.9.9"}]})
+        with self.assertRaises(UnsupportedProfile):
+            build_config({**endpoint, "server": 134744072})
+        with self.assertRaises(UnsupportedProfile):
+            build_config({**endpoint, "server": "8.8.8.8", "type": "direct"})
 
     def test_credential_defaults_only_when_requested(self):
         self.assertNotIn("username", convert_ovpn(PROFILE))
@@ -130,6 +145,37 @@ class Phase1Tests(unittest.TestCase):
         profile = PROFILE + "remote-cert-tls server\nremote-cert-eku 1.3.6.1.5.5.7.3.1\n"
         with self.assertRaises(UnsupportedProfile):
             convert_ovpn(profile)
+
+    def test_inline_client_identity_preserved(self):
+        # Synthetic DER-shaped key only: no real private credential is committed.
+        der = b"\x30\x1e" + b"\x01" * 30
+        key = ("-----BEGIN RSA PRIVATE KEY-----\n"
+               + base64.b64encode(der).decode() + "\n-----END RSA PRIVATE KEY-----\n")
+        profile = PROFILE + f"<cert>\n{CA}</cert>\n<key>\n{key}</key>\n"
+        endpoint = convert_ovpn(profile)
+        self.assertEqual(endpoint["tls"]["client_certificate"], [CA.strip() + "\n"])
+        self.assertEqual(endpoint["tls"]["client_key"], [key])
+        self.assertEqual(build_config(endpoint)["endpoints"][0]["tls"]["client_key"], [key])
+
+    def test_inline_client_identity_fails_closed_on_invalid_input(self):
+        der = b"\x30\x1e" + b"\x01" * 30
+        key = ("-----BEGIN RSA PRIVATE KEY-----\n"
+               + base64.b64encode(der).decode() + "\n-----END RSA PRIVATE KEY-----\n")
+        cert_block = f"<cert>\n{CA}</cert>\n"
+        key_block = f"<key>\n{key}</key>\n"
+        bad = (
+            PROFILE + cert_block,
+            PROFILE + key_block,
+            PROFILE + cert_block + key_block + cert_block,
+            PROFILE + cert_block + key_block.replace("RSA PRIVATE KEY", "ENCRYPTED PRIVATE KEY"),
+            PROFILE + cert_block + key_block.replace(base64.b64encode(der).decode(), "invalid!"),
+            PROFILE + cert_block + key_block.replace(
+                base64.b64encode(der).decode(),
+                base64.b64encode(b"\x30\x21" + b"\x01" * 30).decode()),
+        )
+        for input_profile in bad:
+            with self.subTest(length=len(input_profile)), self.assertRaises(UnsupportedProfile):
+                convert_ovpn(input_profile)
 
     def test_tls_auth_inline(self):
         key = '-----BEGIN OpenVPN Static key V1-----\n' + ('a' * 64 + '\n') * 8 + '-----END OpenVPN Static key V1-----'
