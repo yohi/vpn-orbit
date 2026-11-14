@@ -1,6 +1,6 @@
 # vpn-orbit — Dynamic Tokyo VPN Pool Design R0.1.1（限定訂正案）
 
-> Status: 元のDesign R0.1の設計方針はHuman Owner承認済み。**本R0.1.1は未承認の限定訂正提案**であり、GitHub未反映、実装・実行は未承認。Reviewed HEAD: `e7da31fd035bed95671cd41d42b419a450f2a976`。
+> Status: 元のDesign R0.1の設計方針はHuman Owner承認済み。本R0.1.1はfeatureブランチにCommit・Push済み。ただし、**Human OwnerによるR0.1.1の正式採択は未承認**であり、Stage 1の実装・実行も未承認。Reviewed HEAD（過去の文書レビュー基準点）: `e7da31fd035bed95671cd41d42b419a450f2a976`。
 
 ## 1. 目的
 
@@ -61,6 +61,7 @@ VPN Gateから東京と判定されるVPN出口を自動発見・検証・補充
 - 固定入口IPv4 `119.105.93.237`と`126.234.242.57`はport/protocolを問わず除外する。その他は`RemoteKey`単位で重複排除する。同一IPでもportまたはprotocolが異なれば保持する。同一キーが重複した場合はソート済みカタログ上で最初の候補を採用する。
 - 重複除去後、カタログ順位のままTCP・UDP別に上位20件ずつを暫定選抜する。不足した側の枠は残り全候補から**元のカタログ順位**で埋め、全体の**探索窓`scan_window=40`件**を確定する。TCP・UDPの一方だけで40件に達してよい。IP単位で窓を切らず、異なるport/protocolを早期に失わない。
 - 入口GeoIPは探索窓内の**IPごとに1回**照会・キャッシュし、`TOKYO=0`, `NON_TOKYO=1`, `UNKNOWN=2`の優先ランクを付ける。入口が非東京・不明でも捨てない。入口GeoIPの失敗も`UNKNOWN`として保持する。GeoIPは`https://api.ipapi.is/`のAPIキー付き応答を用い、判定項目は`ip`, `location.country_code`, `location.state`とする。
+- **GeoIP HTTP契約（F-006）**：入口・出口の双方で`POST https://api.ipapi.is/`のみ使用し、`Content-Type: application/json`、JSON本文は`{"q":"<IPv4>","key":"<API_KEY>"}`とする。APIキーをURL・Query String・ログ・例外・Artifactに含めない。HTTPSの証明書とホスト名を通常検証し、redirectを追跡しない（3xxは`UNKNOWN`）。HTTP timeoutは**5秒**、レスポンスは本文読み込み中を含め最大**64KiB（65,536 bytes）**に制限する。HTTP 200以外、200でもトップレベル`error`または`error_code`フィールドが存在する応答、不正JSON、非object応答、タイムアウト、サイズ超過、HTTP/TLS例外はいずれも`GeoDecision.UNKNOWN`。異常応答の本文・秘密を含み得る例外メッセージは出力しない。`TOKYO`は既存の`ip`一致・`location.country_code="JP"`・`location.state="Tokyo"`等の受理条件をすべて満たす場合に限る。
 - **同一IP分散をGeoIP順位より優先する**。探索窓の各IPの候補をカタログ順位で並べ、各候補に同一IP内の出現順`round=0,1,...`を与える。全候補を`(round, ingress_geo_rank, catalog_rank, ip, port, protocol)`の昇順で並べる。したがって第1巡の非東京入口は、第2巡の東京入口より先になる。同一巡内は東京入口を優先する。この規則により入口GeoIPの優先とIP分散が矛盾しない。
 - 上記の並びの先頭から**実接続上限`limit=10`件**を選ぶ。`limit`はCSV行数やGeoIP照会件数ではなく、OpenVPN接続試行数であり、`1 <= limit <= 10`のみ許容する。`scan_window=40`はこの前段の接続候補数とする。採用の最終条件は**隔離VPNを通過した出口IPv4**がGeoIPで東京都と判定されることであり、入口判定は採用条件ではない。
 - 成功例：入口`UNKNOWN`でも出口が`Tokyo`なら`PASS`可能。入口`Tokyo`でも出口が`Osaka`なら`NOT_VERIFIED`。固定2台、未検証TLS、不正/私有IPv4、接続不能候補はWitnessにならない。
