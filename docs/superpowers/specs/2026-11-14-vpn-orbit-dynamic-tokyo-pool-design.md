@@ -84,8 +84,10 @@ VPN Gateから東京と判定されるVPN出口を自動発見・検証・補充
 - OpenVPNを**Namespace内部だけ**で起動し、生成設定に`client`, `dev tun0`, `route-nopull`を強制する。`route-nopull`によってサーバーpushのroute/redirect-gateway/DNSを採用しない一方、**サーバーが指定するTUNのIPv4インターフェースアドレス設定だけはOpenVPNが実施**する。検証器はtun0の確立と妥当なIPv4アドレスを確認し、**IP-Echoサーバーの固定IPv4/32経路だけ**を`dev tun0`へ明示追加する。default routeやその他のpush経路が入れば`FAIL`。`route-nopull`が効かない場合は代替へ緩和しない。
 - IP-Echoは`https://api.ipify.org/`のみ。Host Namespaceで`api.ipify.org`をAレコード解決し、globally routableな応答IPv4を1つ選んでそのプローブ中固定する。Hostの直接IP-Echo結果は証拠として使用しない。Namespace内では`curl -4 --interface tun0 --resolve api.ipify.org:443:<固定IPv4> --noproxy '*' --proto '=https'`相当で実行し、**TLSチェーンとホスト名/SNIを通常検証**する（`-k`禁止、redirect禁止、proxy禁止、短いconnect/total timeout）。応答は`<=64`バイトの厳密なglobally routable IPv4のみ受理する。IP-Echo用の直接veth経路は作らない。
 - **PASS証拠のAND条件**：NamespaceとFirewallが設定済み、トンネル未確立状態ではEchoへの直接接続が拒否される、OpenVPN TLS接続確立、tun0 IPv4あり、`ip -4 route get <echo IPv4>`が`dev tun0`、Echo接続がtun0に束縛されTLS検証成功、取得した出口IPv4がHost側からの鍵付きipapi.is照会で`location.country_code="JP"`かつ`location.state="Tokyo"`、照会対象IPが応答`ip`と一致、全Cleanup成功。いずれか欠けた場合は`PASS`しない。
-- 終了処理は`try/finally`で**60秒/候補**を上限とし、プロセスグループにSIGTERM→猶予3秒→SIGKILL、OpenVPN終了確認、/32 Echo経路・Namespace内nft・Host専用nft/NAT・veth・Namespace・全秘密ファイルの削除、Host `ip_forward`の復元を行う。各操作はべき等・失敗を記録し、Cleanup未完了は**`FAIL`**として最終結果を上書きする。Host既存ルールを破壊しない。
+- 候補ごとに検証器の親プロセスとして独立した監督プロセスを起動し、検証器とは別のプロセスグループ／ライフサイクルでCleanup責任を保持する。監督プロセスは検証器より先にプローブ固有のNamespace名、veth名、専用nftables table/chain識別子、一時ディレクトリを記録し、検証器の正常終了・異常終了・タイムアウト・強制終了を監視する。検証器がSIGKILLされた場合も監督プロセスが所有リソースをべき等に除去・確認し、監督プロセス自身はその確認完了まで終了しない。監督プロセスが起動・監視・Cleanup確認できない場合は`PASS`を返さず`FAIL`とする。
+- 検証器内の終了処理は`try/finally`で**60秒/候補**を上限とし、プロセスグループにSIGTERM→猶予3秒→SIGKILL、OpenVPN終了確認、/32 Echo経路・Namespace内nft・Host専用nft/NAT・veth・Namespace・全秘密ファイルの削除、Host `ip_forward`の復元を行う。各操作はべき等・失敗を記録し、監督プロセスも残存プロセスと記録済みリソースを検査する。Cleanup未完了は**`FAIL`**として最終結果を上書きする。Host既存ルールを破壊しない。
 - **判定の区別**：環境能力不足/隔離設定不可→`BLOCKED`、候補接続不能/TLS拒否/出口不明/非東京/GeoIPエラー→`NOT_VERIFIED`、観測された直接経路への漏れ、許可外外向き通信、予期せぬ経路適用、秘密ログ漏れ、Cleanup失敗→`FAIL`。唯一の`PASS`は上記AND証拠を満たす候補である。より弱い隔離方式へのFallbackは禁止。
+- **Workflow全体statusの集約規則**：候補結果をすべて集約し、1件でも`FAIL`があれば他候補に`PASS`があってもWorkflow全体を必ず`FAIL`とする。`FAIL`がなく、1件以上の候補が`PASS`なら全体を`PASS`とする。`PASS`がなく1件以上`BLOCKED`なら全体を`BLOCKED`、それ以外（候補なしを含む）は`NOT_VERIFIED`とする。候補ごとのstatusとredacted reason codeは保持し、全体statusで候補結果を隠さない。
 
 ### F-004 初回Workflow実行の承認境界（契約）
 
@@ -93,7 +95,7 @@ VPN Gateから東京と判定されるVPN出口を自動発見・検証・補充
 - GitHub Actionsの`workflow_dispatch`はWorkflowファイルが**default branch (`master`)に存在**して初めて実行可能。featureブランチへの作成/Pushだけでは初回dispatchできない。**feature側の実装/Commit承認、master反映承認、初回dispatch承認は独立**しており、どれも本書の文書承認によって付与されない。dispatch未承認ならPlan Task 4は`HOLD`。
 - Stage 1は手動起動1回の限定実証まで。2時間ごとのActions定期検証は将来のStage 2以降の採用方式であり、**Stage 1ではCronも自動実行も追加しない**。既存Worker/KV/固定2台は変更しない。
 
-**共通テスト・完了条件**：候補40件/TCP・UDP配分/実接続10件/決定的順序、入口非東京/不明でも出口東京を許す判定、TLS設定変換・証明書鍵一致と拒否系、Host/Namespace通信の許可/拒否とCleanup、manual-only Workflow/default-branch HOLDをオフラインテストの必須対象とする。オフラインテストPASSはクラウド実証PASSを意味しない。Stage 1の成功は**固定2台以外の少なくとも1台**について前記AND証拠を得た場合だけで、本番への自動採用権限は含まない。
+**共通テスト・完了条件**：候補40件/TCP・UDP配分/実接続10件/決定的順序、入口非東京/不明でも出口東京を許す判定、TLS設定変換・証明書鍵一致と拒否系、Host/Namespace通信の許可/拒否、検証器SIGKILL後に監督プロセスがNamespace/経路/Firewallルール/非公開一時ファイルを除去・確認するCleanupテスト、候補AのCleanup失敗`FAIL`と候補BのAND条件を満たす`PASS`混在時に全体が`FAIL`となる集約テスト、manual-only Workflow/default-branch HOLDをオフラインテストの必須対象とする。オフラインテストPASSはクラウド実証PASSを意味しない。Stage 1の成功は**固定2台以外の少なくとも1台**について前記AND証拠を得た場合だけで、本番への自動採用権限は含まない。
 
 **参照一次資料**：OpenVPN 2.6 manual（`route-nopull`）、ipapi.is API Docs（key付き応答の`location.state`）、GitHub Docs（`workflow_dispatch`はdefault branch必須）。
 
