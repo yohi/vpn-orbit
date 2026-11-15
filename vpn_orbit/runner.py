@@ -9,8 +9,25 @@ from __future__ import annotations
 import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+
+
+@dataclass(frozen=True)
+class CurlOutcome:
+    """Typed outcome of a curl-through-tunnel request.
+
+    `safety_violation` is an optional stable code such as
+    "unauthorized_egress" that indicates the probe must FAIL.
+    """
+
+    body: str | None
+    error: str
+    safety_violation: str | None = None
+
+    def is_success(self) -> bool:
+        return self.body is not None and self.safety_violation is None
 
 
 class IsolationResources:
@@ -56,20 +73,37 @@ class ProbeRunner(Protocol):
         self, remote_ip: str, protocol: str, port: int, private_dir: Path
     ) -> IsolationResources: ...
     def teardown_isolation(self, resources: IsolationResources) -> tuple[bool, str]: ...
-    def start_supervisor(self, resources: IsolationResources) -> Any: ...
-    def start_openvpn(self, config_path: Path, resources: IsolationResources) -> ProcessHandle: ...
+    def start_supervisor(self, resources: IsolationResources) -> tuple[bool, str]: ...
+    def confirm_supervisor_cleanup(self, resources: IsolationResources) -> tuple[bool, str]: ...
+    def start_openvpn(
+        self,
+        config_path: Path,
+        resources: IsolationResources,
+        *,
+        env: dict[str, str] | None,
+        cwd: Path | None,
+    ) -> ProcessHandle: ...
     def wait_for_tun(
         self, process: ProcessHandle, resources: IsolationResources, deadline: float
     ) -> tuple[str | None, str]: ...
-    def resolve_host(self, hostname: str) -> tuple[str | None, str]: ...
+    def resolve_host(self, hostname: str, deadline: float) -> tuple[str | None, str]: ...
     def curl_via_tun(
         self,
         url: str,
-        resolve: tuple[str, int],
+        resolve: tuple[str, int, str],
         interface: str,
         resources: IsolationResources,
         deadline: float,
-    ) -> tuple[str | None, str]: ...
+    ) -> CurlOutcome: ...
+    def pre_tunnel_echo_check(
+        self, echo_ip: str, resources: IsolationResources, deadline: float
+    ) -> tuple[bool, str]: ...
+    def route_get_via_tun0(
+        self, echo_ip: str, resources: IsolationResources, deadline: float
+    ) -> tuple[bool, str]: ...
+    def host_default_route_unchanged(self) -> tuple[bool, str]: ...
+    def save_host_ip_forward(self) -> tuple[bool, str]: ...
+    def restore_host_ip_forward(self, original: str) -> tuple[bool, str]: ...
     def terminate(self, process: ProcessHandle, graceful_s: float) -> tuple[bool, str]: ...
     def now(self) -> float: ...
     def sleep(self, seconds: float) -> None: ...
@@ -100,6 +134,8 @@ class SubprocessRunner:
         for binary in ("ip", "nft", "openvpn", "curl", "openssl"):
             if not shutil.which(binary):
                 return False
+        if not Path("/dev/net/tun").exists():
+            return False
         try:
             result = subprocess.run(
                 ["ip", "netns", "add", "_vpn_orbit_test"],
@@ -117,19 +153,55 @@ class SubprocessRunner:
     def teardown_isolation(self, resources: IsolationResources) -> tuple[bool, str]:
         raise NotImplementedError("live runner is intentionally unimplemented in this stage")
 
-    def start_supervisor(self, resources: IsolationResources) -> None:
+    def start_supervisor(self, resources: IsolationResources) -> tuple[bool, str]:
         raise NotImplementedError("live runner is intentionally unimplemented in this stage")
 
-    def start_openvpn(self, config_path: Path, resources: IsolationResources) -> ProcessHandle:
+    def confirm_supervisor_cleanup(self, resources: IsolationResources) -> tuple[bool, str]:
+        raise NotImplementedError("live runner is intentionally unimplemented in this stage")
+
+    def start_openvpn(
+        self,
+        config_path: Path,
+        resources: IsolationResources,
+        *,
+        env: dict[str, str] | None,
+        cwd: Path | None,
+    ) -> ProcessHandle:
         raise NotImplementedError("live runner is intentionally unimplemented in this stage")
 
     def wait_for_tun(self, process: ProcessHandle, resources: IsolationResources, deadline: float) -> tuple[str | None, str]:
         raise NotImplementedError("live runner is intentionally unimplemented in this stage")
 
-    def resolve_host(self, hostname: str) -> tuple[str | None, str]:
+    def resolve_host(self, hostname: str, deadline: float) -> tuple[str | None, str]:
         raise NotImplementedError("live runner is intentionally unimplemented in this stage")
 
-    def curl_via_tun(self, url: str, resolve: tuple[str, int], interface: str, resources: IsolationResources, deadline: float) -> tuple[str | None, str]:
+    def curl_via_tun(
+        self,
+        url: str,
+        resolve: tuple[str, int, str],
+        interface: str,
+        resources: IsolationResources,
+        deadline: float,
+    ) -> CurlOutcome:
+        raise NotImplementedError("live runner is intentionally unimplemented in this stage")
+
+    def pre_tunnel_echo_check(
+        self, echo_ip: str, resources: IsolationResources, deadline: float
+    ) -> tuple[bool, str]:
+        raise NotImplementedError("live runner is intentionally unimplemented in this stage")
+
+    def route_get_via_tun0(
+        self, echo_ip: str, resources: IsolationResources, deadline: float
+    ) -> tuple[bool, str]:
+        raise NotImplementedError("live runner is intentionally unimplemented in this stage")
+
+    def host_default_route_unchanged(self) -> tuple[bool, str]:
+        raise NotImplementedError("live runner is intentionally unimplemented in this stage")
+
+    def save_host_ip_forward(self) -> tuple[bool, str]:
+        raise NotImplementedError("live runner is intentionally unimplemented in this stage")
+
+    def restore_host_ip_forward(self, original: str) -> tuple[bool, str]:
         raise NotImplementedError("live runner is intentionally unimplemented in this stage")
 
     def terminate(self, process: ProcessHandle, graceful_s: float) -> tuple[bool, str]:
@@ -140,112 +212,3 @@ class SubprocessRunner:
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
-
-
-class FakeRunner:
-    """Test double that records calls and returns canned probe results."""
-
-    def __init__(self, tmp: Path) -> None:
-        self.tmp = tmp
-        self.prerequisites_ok_value = True
-        self.cleaned = False
-        self.supervisor_started = False
-        self.wait_for_tun_result: tuple[str | None, str] = ("10.8.0.2", "ok")
-        self.curl_result: tuple[str | None, str] = ("1.1.1.1", "ok")
-        self.exit_ip = "1.1.1.1"
-        self.unauthorized_egress = False
-        self.cleanup_fail = False
-        self.host_route_modified = False
-        self.has_default_route = False
-        self.has_remote_32_route = True
-        self.has_echo_32_route = True
-        self.commands: list[str] = []
-        self.last_setup: tuple[str, str, int] | None = None
-        self.last_config: bytes = b""
-        self._resources: IsolationResources | None = None
-
-    def prerequisites_ok(self) -> bool:
-        return self.prerequisites_ok_value
-
-    def setup_isolation(
-        self, remote_ip: str, protocol: str, port: int, private_dir: Path
-    ) -> IsolationResources:
-        self.last_setup = (remote_ip, protocol, port)
-        self.commands.append("ip netns add test-ns")
-        self.commands.append("ip link add veth0 type veth peer veth1")
-        self.commands.append(f"ip route add {remote_ip}/32 via 10.200.1.1")
-        if not self.has_default_route:
-            self.commands.append("default route absent")
-        if self.unauthorized_egress:
-            self.commands.append("unauthorized egress observed")
-        self._resources = IsolationResources(
-            netns="test-ns",
-            private_dir=private_dir,
-            veth_host="veth0",
-            veth_ns="veth1",
-            remote_ip=remote_ip,
-            protocol=protocol,
-            port=port,
-        )
-        return self._resources
-
-    def teardown_isolation(self, resources: IsolationResources) -> tuple[bool, str]:
-        self.cleaned = True
-        self.commands.append("ip netns del test-ns")
-        self.commands.append("nft delete table ip vpn_orbit_probe")
-        if self.cleanup_fail:
-            return False, "cleanup command failed"
-        return True, ""
-
-    def start_supervisor(self, resources: IsolationResources) -> None:
-        self.supervisor_started = True
-        self.commands.append("supervisor started")
-
-    def start_openvpn(self, config_path: Path, resources: IsolationResources) -> ProcessHandle:
-        self.last_config = config_path.read_bytes()
-        return _FakeProcess(123)
-
-    def wait_for_tun(self, process: ProcessHandle, resources: IsolationResources, deadline: float) -> tuple[str | None, str]:
-        return self.wait_for_tun_result
-
-    def resolve_host(self, hostname: str) -> tuple[str | None, str]:
-        return (self.exit_ip, "ok")
-
-    def curl_via_tun(
-        self,
-        url: str,
-        resolve: tuple[str, int],
-        interface: str,
-        resources: IsolationResources,
-        deadline: float,
-    ) -> tuple[str | None, str]:
-        if self.unauthorized_egress:
-            return (None, "unauthorized egress observed")
-        return self.curl_result
-
-    def terminate(self, process: ProcessHandle, graceful_s: float) -> tuple[bool, str]:
-        return (True, "")
-
-    def now(self) -> float:
-        return 0.0
-
-    def sleep(self, seconds: float) -> None:
-        pass
-
-
-class _FakeProcess:
-    def __init__(self, pid: int) -> None:
-        self._pid = pid
-
-    @property
-    def pid(self) -> int:
-        return self._pid
-
-    def poll(self) -> int | None:
-        return 0
-
-    def terminate(self) -> None:
-        pass
-
-    def kill(self) -> None:
-        pass

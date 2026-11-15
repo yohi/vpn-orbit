@@ -13,7 +13,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .phase1 import UnsupportedProfile
+from .phase1 import AUTHS, CIPHERS, UnsupportedProfile
 
 _ALLOWED_ENDPOINT_KEYS: frozenset[str] = frozenset({
     "type", "tag", "mode", "server", "server_port", "network",
@@ -38,28 +38,43 @@ def _write_private_file(path: Path, data: bytes) -> None:
         file.write(data)
 
 
-def _spki_match(cert_pem: bytes, key_pem: bytes) -> tuple[bool, str]:
+def _validate_pem(ca: str) -> None:
+    """Validate that a string is a well-formed PEM certificate."""
+    from ssl import PEM_cert_to_DER_cert
+    normalized = ca.strip()
+    if not normalized.startswith("-----BEGIN CERTIFICATE-----"):
+        raise UnsupportedProfile("CA element is not a PEM certificate")
+    try:
+        PEM_cert_to_DER_cert(normalized)
+    except ValueError as exc:
+        raise UnsupportedProfile("malformed CA PEM") from exc
+
+
+def _spki_match(cert_pem: bytes, key_pem: bytes, timeout_s: float = 10.0) -> tuple[bool, str]:
     """Compare the public keys of a cert and a private key using OpenSSL."""
     try:
         cert_pub = subprocess.run(
             ["openssl", "x509", "-pubkey", "-noout"],
             input=cert_pem,
             capture_output=True,
+            timeout=timeout_s,
             check=True,
         ).stdout
         pub_der = subprocess.run(
             ["openssl", "pkey", "-pubin", "-outform", "DER"],
             input=cert_pub,
             capture_output=True,
+            timeout=timeout_s,
             check=True,
         ).stdout
         key_der = subprocess.run(
             ["openssl", "pkey", "-pubout", "-outform", "DER"],
             input=key_pem,
             capture_output=True,
+            timeout=timeout_s,
             check=True,
         ).stdout
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
         return False, "SPKI comparison failed"
     return pub_der == key_der, ""
 
@@ -85,6 +100,9 @@ def synthesize_openvpn_config(
     Files are written under ``private_dir`` (expected to already exist with
     mode 0700) with mode 0600. The returned bytes are the generated config;
     raw untrusted ``.ovpn`` files are never referenced via ``--config``.
+
+    The config uses absolute paths for file directives so the OpenVPN CWD is
+    not security-critical.
     """
     _reject_env_secrets()
 
@@ -105,6 +123,11 @@ def synthesize_openvpn_config(
     if parsed_endpoint.get("network") != protocol:
         raise UnsupportedProfile("probe protocol does not match endpoint network")
 
+    endpoint_server = parsed_endpoint.get("server")
+    endpoint_port = parsed_endpoint.get("server_port")
+    if endpoint_server != remote_ip or endpoint_port != port:
+        raise UnsupportedProfile("synthesized remote does not match parsed endpoint")
+
     tls = parsed_endpoint.get("tls")
     if not isinstance(tls, dict):
         raise UnsupportedProfile("tls section missing")
@@ -113,9 +136,14 @@ def synthesize_openvpn_config(
         raise UnsupportedProfile(f"unknown tls keys: {sorted(unknown_tls)}")
 
     ca_certs = tls.get("certificate")
-    if not isinstance(ca_certs, list) or not ca_certs or not isinstance(ca_certs[0], str):
+    if not isinstance(ca_certs, list) or not ca_certs:
         raise UnsupportedProfile("CA certificate missing")
-    ca_pem = ca_certs[0].encode()
+    validated_ca_certs: list[bytes] = []
+    for item in ca_certs:
+        if not isinstance(item, str):
+            raise UnsupportedProfile("CA certificate must be a string")
+        _validate_pem(item)
+        validated_ca_certs.append(item.encode())
 
     cert_pem: bytes | None = None
     key_pem: bytes | None = None
@@ -138,6 +166,10 @@ def synthesize_openvpn_config(
     remote_cert_eku = tls.get("remote_certificate_eku")
     if remote_cert_eku and remote_cert_tls:
         raise UnsupportedProfile("remote-cert-tls and remote-cert-eku are mutually exclusive")
+    if remote_cert_tls is not None and remote_cert_tls != "server":
+        raise UnsupportedProfile("remote-cert-tls must be server")
+    if remote_cert_tls is None and remote_cert_eku is None:
+        raise UnsupportedProfile("server identity verification required")
 
     server_name = tls.get("server_name")
     server_name_type = tls.get("server_name_type", "name")
@@ -182,41 +214,59 @@ def synthesize_openvpn_config(
     data_ciphers = parsed_endpoint.get("data_ciphers", [])
     if not isinstance(data_ciphers, list) or not data_ciphers:
         raise UnsupportedProfile("data_ciphers missing")
+    allowed_ciphers = {c.upper() for c in data_ciphers}
+    if not allowed_ciphers.issubset(CIPHERS):
+        raise UnsupportedProfile("unsupported data-ciphers")
+
     fallback = parsed_endpoint.get("data_ciphers_fallback")
+    if not isinstance(fallback, str) or fallback.upper() not in CIPHERS:
+        raise UnsupportedProfile("unsupported data-ciphers-fallback")
+
     auth = parsed_endpoint.get("auth")
+    if not isinstance(auth, str) or auth.upper() not in AUTHS:
+        raise UnsupportedProfile("unsupported auth")
 
     # Write files under private_dir.
-    _write_private_file(private_dir / "ca.pem", ca_pem)
+    ca_path = private_dir / "ca.pem"
+    _write_private_file(ca_path, b"\n".join(validated_ca_certs) + b"\n")
+    cert_path = private_dir / "cert.pem"
+    key_path = private_dir / "key.pem"
     if cert_pem is not None:
-        _write_private_file(private_dir / "cert.pem", cert_pem)
-        _write_private_file(private_dir / "key.pem", key_pem)
+        _write_private_file(cert_path, cert_pem)
+        _write_private_file(key_path, key_pem)
+    auth_path = private_dir / "auth.txt"
     if username is not None:
-        _write_private_file(private_dir / "auth.txt", f"{username}\n{password}\n".encode())
+        _write_private_file(auth_path, f"{username}\n{password}\n".encode())
+    wrap_file_path: Path | None = None
     if wrap_path is not None:
-        _write_private_file(private_dir / wrap_path, key_material.encode() + b"\n")
+        wrap_file_path = private_dir / wrap_path
+        _write_private_file(wrap_file_path, key_material.encode() + b"\n")
 
-    # Build the CLI config from the allowlist only.
+    # Build the CLI config from the allowlist only, using absolute paths.
+    def file_arg(name: str, path: Path) -> str:
+        return f"{name} {shlex.quote(str(path))}"
+
     lines: list[str] = [
         "client",
-        "dev tun",
+        "dev tun0",
         "nobind",
         "persist-key",
         "persist-tun",
         "route-nopull",
         f"proto {'udp' if protocol == 'udp' else 'tcp-client'}",
         f"remote {remote_ip} {port}",
-        "ca ca.pem",
+        file_arg("ca", ca_path),
     ]
     if cert_pem is not None:
-        lines.extend(["cert cert.pem", "key key.pem"])
+        lines.extend([file_arg("cert", cert_path), file_arg("key", key_path)])
     if username is not None:
-        lines.append("auth-user-pass auth.txt")
-    if wrap_path is not None:
+        lines.append(file_arg("auth-user-pass", auth_path))
+    if wrap_file_path is not None:
         directive_name = "tls-auth" if wrap_type == "tls_auth" else "tls-crypt"
         if wrap_direction is not None:
-            lines.append(f"{directive_name} {wrap_path} {wrap_direction}")
+            lines.append(f"{directive_name} {shlex.quote(str(wrap_file_path))} {wrap_direction}")
         else:
-            lines.append(f"{directive_name} {wrap_path}")
+            lines.append(f"{directive_name} {shlex.quote(str(wrap_file_path))}")
     if remote_cert_eku:
         lines.append(f"remote-cert-eku {_quote_word(remote_cert_eku)}")
     elif remote_cert_tls:
@@ -224,9 +274,7 @@ def synthesize_openvpn_config(
     if server_name is not None:
         lines.append(f"verify-x509-name {_quote_word(server_name)} {_quote_word(server_name_type)}")
     lines.append(f"data-ciphers {':'.join(data_ciphers)}")
-    if fallback:
-        lines.append(f"data-ciphers-fallback {fallback}")
-    if auth:
-        lines.append(f"auth {auth}")
+    lines.append(f"data-ciphers-fallback {fallback}")
+    lines.append(f"auth {auth}")
 
     return ("\n".join(lines) + "\n").encode()

@@ -11,8 +11,19 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Literal
 
 from .geoip import GeoDecision
-from .openvpn_probe import ProbeResult, ProbeStatus, probe_one
+from .openvpn_probe import ProbeResult, ProbeStatus, probe_candidates, probe_one
 from .phase1 import Candidate, convert_ovpn, parse_catalog
+
+
+__all__ = [
+    "aggregate_status",
+    "RemoteKey",
+    "ScreenedCandidate",
+    "screen_candidates",
+    "probe_candidates",
+    "ProbeStatus",
+    "ProbeResult",
+]
 
 
 def aggregate_status(results: Iterable[ProbeStatus]) -> ProbeStatus:
@@ -165,15 +176,4 @@ def screen_candidates(
     return [entry[1] for entry in entries[:limit]]
 
 
-def probe_candidates(
-    candidates: Iterable[ScreenedCandidate],
-    *,
-    geo_lookup: Callable[[str], GeoDecision],
-    timeout_s: int = 60,
-    runner=None,
-) -> list[ProbeResult]:
-    """Verify each screened candidate and return per-probe results."""
-    return [
-        probe_one(candidate, geo_lookup=geo_lookup, timeout_s=timeout_s, runner=runner)
-        for candidate in candidates
-    ]
+# probe_candidates is re-exported from openvpn_probe.
