@@ -1,17 +1,46 @@
 """Cloud candidate screening: VPN Gate catalog -> ranked shortlist.
 
 Implements F-001 selection order, fixed-IP exclusion, RemoteKey deduplication,
-TCP/UDP windowing, per-IP GeoIP caching, and deterministic ranking.
+TCP/UDP windowing, per-IP GeoIP caching, deterministic ranking, and workflow
+status aggregation.
 """
 from __future__ import annotations
 
 import ipaddress
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Literal
+from typing import Callable, Iterable, Literal
 
 from .geoip import GeoDecision
 from .phase1 import Candidate, convert_ovpn, parse_catalog
+
+
+class ProbeStatus(Enum):
+    """Outcome of a single probe attempt."""
+
+    PASS = "PASS"
+    NOT_VERIFIED = "NOT_VERIFIED"
+    BLOCKED = "BLOCKED"
+    FAIL = "FAIL"
+
+
+def aggregate_status(results: Iterable[ProbeStatus]) -> ProbeStatus:
+    """Aggregate probe results into a single workflow status.
+
+    Contract from F-004:
+    - Any FAIL -> overall FAIL
+    - Otherwise any PASS -> PASS
+    - Otherwise any BLOCKED -> BLOCKED
+    - Otherwise NOT_VERIFIED (including empty results)
+    """
+    seen = set(results)
+    if ProbeStatus.FAIL in seen:
+        return ProbeStatus.FAIL
+    if ProbeStatus.PASS in seen:
+        return ProbeStatus.PASS
+    if ProbeStatus.BLOCKED in seen:
+        return ProbeStatus.BLOCKED
+    return ProbeStatus.NOT_VERIFIED
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +48,18 @@ class RemoteKey:
     ip: str
     port: int
     protocol: Literal["tcp", "udp"]
+
+    def __post_init__(self):
+        try:
+            parsed = ipaddress.ip_address(self.ip)
+        except ValueError as exc:
+            raise ValueError(f"remote IP must be a valid IPv4 address: {self.ip}") from exc
+        if not isinstance(parsed, ipaddress.IPv4Address) or not parsed.is_global:
+            raise ValueError(f"remote IP must be a globally routable IPv4 address: {self.ip}")
+        if not 1 <= self.port <= 65535:
+            raise ValueError(f"remote port must be 1..65535: {self.port}")
+        if self.protocol not in ("tcp", "udp"):
+            raise ValueError(f"remote protocol must be tcp or udp: {self.protocol}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +72,7 @@ class ScreenedCandidate:
 
 _FIXED_PIN_IPS: frozenset[str] = frozenset({"119.105.93.237", "126.234.242.57"})
 _PROTOCOL_QUOTA = 20
+_MAX_SCAN_WINDOW = 1000
 
 
 def _to_ip_int(ip: str) -> int:
@@ -46,8 +88,8 @@ def screen_candidates(
     limit: int = 10,
 ) -> list[ScreenedCandidate]:
     """Return a deterministic shortlist of screened VPN Gate candidates."""
-    if not 1 <= scan_window:
-        raise ValueError("scan_window must be positive")
+    if not 1 <= scan_window <= _MAX_SCAN_WINDOW:
+        raise ValueError(f"scan_window must be between 1 and {_MAX_SCAN_WINDOW}")
     if not 1 <= limit <= 10:
         raise ValueError("limit must be between 1 and 10")
 
@@ -68,7 +110,10 @@ def screen_candidates(
         network = endpoint.get("network")
         if not isinstance(ip, str) or not isinstance(port, int) or network not in ("tcp", "udp"):
             continue
-        key = RemoteKey(ip=ip, port=port, protocol=network)
+        try:
+            key = RemoteKey(ip=ip, port=port, protocol=network)
+        except ValueError:
+            continue
         if key in seen_keys:
             continue
         seen_keys.add(key)

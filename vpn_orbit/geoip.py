@@ -22,6 +22,17 @@ class GeoDecision(Enum):
     UNKNOWN = 2
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Disable HTTP redirect following for GeoIP lookups.
+
+    Returning None from redirect_request causes urllib to raise HTTPError,
+    which lookup_geoip maps to GeoDecision.UNKNOWN.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def decide_tokyo(ip: str, response: dict) -> GeoDecision:
     """Return TOKYO only when response confirms the exact IP is in Tokyo, JP."""
     if not isinstance(response, dict):
@@ -50,7 +61,7 @@ def _create_opener() -> urllib.request.OpenerDirector:
     """Build an HTTPS opener with default TLS verification and no redirects."""
     context = ssl.create_default_context()
     https_handler = urllib.request.HTTPSHandler(context=context)
-    return urllib.request.build_opener(https_handler)
+    return urllib.request.build_opener(_NoRedirectHandler, https_handler)
 
 
 def lookup_geoip(ip: str, *, api_key: str, timeout_s: float = 5.0) -> GeoDecision:
@@ -59,18 +70,18 @@ def lookup_geoip(ip: str, *, api_key: str, timeout_s: float = 5.0) -> GeoDecisio
     Any non-200 response, error field, malformed JSON, timeout, oversized body,
     or exception yields GeoDecision.UNKNOWN. Secrets are never emitted.
     """
-    body = json.dumps({"q": ip, "key": api_key}, separators=(",", ":")).encode("utf-8")
-    request = urllib.request.Request(
-        API_URL,
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-    )
-    opener = _create_opener()
     try:
+        body = json.dumps({"q": ip, "key": api_key}, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(
+            API_URL,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
+        opener = _create_opener()
         with opener.open(request, timeout=timeout_s) as response:
             if response.getcode() != 200:
                 return GeoDecision.UNKNOWN

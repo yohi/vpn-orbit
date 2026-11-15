@@ -1,12 +1,15 @@
 """Tests for GeoIP Tokyo decision and outbound HTTP adapter."""
 from __future__ import annotations
 
+import io
 import json
 import ssl
+import sys
 import unittest
+import urllib.request
 from unittest.mock import patch
 
-from vpn_orbit.geoip import GeoDecision, decide_tokyo, lookup_geoip
+from vpn_orbit.geoip import GeoDecision, _NoRedirectHandler, _create_opener, decide_tokyo, lookup_geoip
 
 
 class FakeResponse:
@@ -151,9 +154,34 @@ class LookupGeoIPTests(unittest.TestCase):
             raise ssl.SSLError("certificate verify failed")
 
         opener.open = raise_ssl
-        with patch("vpn_orbit.geoip._create_opener", return_value=opener):
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+        with (
+            patch("vpn_orbit.geoip._create_opener", return_value=opener),
+            patch.object(sys, "stdout", stdout_capture),
+            patch.object(sys, "stderr", stderr_capture),
+        ):
             result = lookup_geoip("8.8.8.8", api_key="secret-key")
         self.assertEqual(result, GeoDecision.UNKNOWN)
+        combined_output = stdout_capture.getvalue() + stderr_capture.getvalue()
+        self.assertNotIn("secret-key", combined_output)
+
+
+class OpenerConfigurationTests(unittest.TestCase):
+    def test_create_opener_disables_redirects(self):
+        opener = _create_opener()
+        redirect_handlers = [h for h in opener.handlers if isinstance(h, _NoRedirectHandler)]
+        self.assertEqual(len(redirect_handlers), 1)
+        handler = redirect_handlers[0]
+        self.assertIsNone(handler.redirect_request(None, None, 302, "Found", {}, "https://example.com/"))
+
+    def test_create_opener_enables_tls_verification(self):
+        opener = _create_opener()
+        https_handlers = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPSHandler)]
+        self.assertEqual(len(https_handlers), 1)
+        context = https_handlers[0]._context
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
 
 
 if __name__ == "__main__":
