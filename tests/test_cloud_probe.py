@@ -9,10 +9,12 @@ import unittest
 
 from vpn_orbit.cloud_probe import (
     GeoDecision,
+    ProbeResult,
     ProbeStatus,
     RemoteKey,
     ScreenedCandidate,
     aggregate_status,
+    probe_candidates,
     screen_candidates,
 )
 from vpn_orbit.phase1 import Candidate
@@ -292,6 +294,49 @@ class RemoteKeyTests(unittest.TestCase):
     def test_rejects_invalid_protocol(self):
         with self.assertRaises(ValueError):
             RemoteKey("8.8.8.8", 1195, "icmp")
+
+
+class ProbeCandidatesTests(unittest.TestCase):
+    def test_empty_candidates_returns_empty_results(self):
+        results = probe_candidates([], geo_lookup=lambda ip: GeoDecision.UNKNOWN)
+        self.assertEqual(results, [])
+
+    def test_probe_candidates_aggregates_to_not_verified_when_all_blocked(self):
+        ca = (Path(__file__).parent / "fixtures" / "test-ca.pem").read_text()
+        profile = f"""client
+proto udp
+remote 8.8.8.8 1195
+cipher AES-128-CBC
+auth SHA1
+remote-cert-tls server
+<ca>
+{ca}</ca>
+"""
+        candidate = ScreenedCandidate(
+            candidate=Candidate(
+                host="test", ip="8.8.8.8", country="JP", ping_ms=1,
+                speed_bps=1, score=1, profile=profile,
+            ),
+            remote=RemoteKey("8.8.8.8", 1195, "udp"),
+            ingress_geo=GeoDecision.TOKYO,
+            catalog_rank=1,
+        )
+        class NoopRunner:
+            def prerequisites_ok(self):
+                return False
+            def setup_isolation(self, *args, **kwargs):
+                raise AssertionError("should not be called")
+        results = probe_candidates([candidate], geo_lookup=lambda ip: GeoDecision.UNKNOWN, runner=NoopRunner())
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, ProbeStatus.BLOCKED)
+        self.assertEqual(aggregate_status(r.status for r in results), ProbeStatus.BLOCKED)
+
+    def test_probe_result_is_typed_value_object(self):
+        result = ProbeResult(
+            ingress_ip="8.8.8.8", port=1195, protocol="udp",
+            exit_ip="1.1.1.1", status=ProbeStatus.PASS, reason_code="ok",
+        )
+        self.assertIsInstance(result.status, ProbeStatus)
 
 
 if __name__ == "__main__":

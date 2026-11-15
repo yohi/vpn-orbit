@@ -8,20 +8,11 @@ from __future__ import annotations
 
 import ipaddress
 from dataclasses import dataclass
-from enum import Enum
 from typing import Callable, Iterable, Literal
 
 from .geoip import GeoDecision
+from .openvpn_probe import ProbeResult, ProbeStatus, probe_one
 from .phase1 import Candidate, convert_ovpn, parse_catalog
-
-
-class ProbeStatus(Enum):
-    """Outcome of a single probe attempt."""
-
-    PASS = "PASS"
-    NOT_VERIFIED = "NOT_VERIFIED"
-    BLOCKED = "BLOCKED"
-    FAIL = "FAIL"
 
 
 def aggregate_status(results: Iterable[ProbeStatus]) -> ProbeStatus:
@@ -172,3 +163,17 @@ def screen_candidates(
 
     entries.sort(key=lambda item: item[0])
     return [entry[1] for entry in entries[:limit]]
+
+
+def probe_candidates(
+    candidates: Iterable[ScreenedCandidate],
+    *,
+    geo_lookup: Callable[[str], GeoDecision],
+    timeout_s: int = 60,
+    runner=None,
+) -> list[ProbeResult]:
+    """Verify each screened candidate and return per-probe results."""
+    return [
+        probe_one(candidate, geo_lookup=geo_lookup, timeout_s=timeout_s, runner=runner)
+        for candidate in candidates
+    ]
