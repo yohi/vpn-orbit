@@ -55,6 +55,30 @@ def reap_children() -> bool:
     return False
 
 
+def _deadline_cleanup_receipt(channel: socket.socket, resources: IsolationResources,
+                              proc: subprocess.Popen[bytes] | None, packet: bytes | None = None) -> bool:
+    stopped = stop_group(proc)
+    cleaned = remove_resources(resources, Commands(time.monotonic() + 10)) and stopped
+    communication_deadline = time.monotonic() + 5
+    try:
+        while time.monotonic() < communication_deadline:
+            channel.settimeout(max(0.001, communication_deadline - time.monotonic()))
+            if packet is None:
+                packet = channel.recv(65536)
+            if not packet:
+                break
+            op = json.loads(packet)["op"]
+            # Only confirmed cleanup evidence survives the work deadline; never start more work.
+            reply = {"ok": cleaned if op == "cleanup" else stopped if op == "stop" else False}
+            channel.send(json.dumps(reply).encode())
+            if op == "cleanup":
+                break
+            packet = None
+    except (OSError, ValueError, KeyError):
+        pass  # Cleanup responsibility remains with serve even if the verifier disappears.
+    return cleaned
+
+
 def serve(channel: socket.socket, resources: IsolationResources) -> None:
     # Adopt orphan grandchildren so SIGKILL does not leave zombie helpers.
     libc = ctypes.CDLL(None, use_errno=True)
@@ -67,9 +91,16 @@ def serve(channel: socket.socket, resources: IsolationResources) -> None:
     channel.send(b'{"ok":true}')
     try:
         while True:
-            channel.settimeout(max(0.001, resources.deadline - time.monotonic()))
-            packet = channel.recv(65536)
+            try:
+                channel.settimeout(max(0.001, resources.deadline - time.monotonic()))
+                packet = channel.recv(65536)
+            except TimeoutError:
+                cleanup_ok = _deadline_cleanup_receipt(channel, resources, proc)
+                break
             if not packet:
+                break
+            if time.monotonic() >= resources.deadline:
+                cleanup_ok = _deadline_cleanup_receipt(channel, resources, proc, packet)
                 break
             request = json.loads(packet)
             match request["op"]:

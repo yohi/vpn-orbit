@@ -77,7 +77,7 @@ def _check_supervisor_kills_reaps_and_cleans(tmp_path, termination):
         (tmp_path / name).touch()
     r = IsolationResources(netns="vo-test", private_dir=private, veth_host="vh-test",
         veth_ns="vn-test", remote_ip="8.8.8.8", protocol="udp", port=1195)
-    r.deadline = time.monotonic() + (1 if termination == "deadline" else 20)
+    r.deadline = time.monotonic() + (1 if termination in ("deadline", "race") else 20)
     (tmp_path / "nft").write_text(r.table)
     listener = socket.socket(socket.AF_UNIX)
     listener.bind(str(tmp_path / "ready.sock"))
@@ -91,19 +91,25 @@ def _check_supervisor_kills_reaps_and_cleans(tmp_path, termination):
     supervisor_channel.close()
     verifier_code = '''
 import json, signal, socket, sys
+from types import SimpleNamespace
+from vpn_orbit.supervisor_client import SupervisorClient
 with socket.socket(fileno=int(sys.argv[1])) as channel:
+    client = SupervisorClient.__new__(SupervisorClient)
+    client.channel = channel
+    client.deadline = float(sys.argv[2])
+    client.resources = SimpleNamespace(deadline=client.deadline)
     channel.recv(65536)
     channel.send(b'{"op":"start"}')
     reply = json.loads(channel.recv(65536))
     print(reply["pid"], flush=True)
     def finish(signum, frame):
-        channel.send(b'{"op":"cleanup"}')
-        assert json.loads(channel.recv(65536))["ok"]
+        assert client.request("stop")["ok"]
+        assert client.request("cleanup")["ok"]
         sys.exit(0)
     signal.signal(signal.SIGUSR1, finish)
     signal.pause()
 '''
-    verifier = subprocess.Popen([sys.executable, "-c", verifier_code, str(owner_channel.fileno())],
+    verifier = subprocess.Popen([sys.executable, "-c", verifier_code, str(owner_channel.fileno()), str(r.deadline)],
         pass_fds=(owner_channel.fileno(),), stdout=subprocess.PIPE, text=True)
     owner_channel.close()
     output = verifier.stdout
@@ -126,6 +132,14 @@ with socket.socket(fileno=int(sys.argv[1])) as channel:
                 assert verifier.wait(timeout=8) == 0
             case "deadline":
                 assert verifier.poll() is None
+            case "race":
+                # Wait for autonomous cleanup, not a guessed scheduling delay.
+                until = time.monotonic() + 8
+                while private.exists() and time.monotonic() < until:
+                    time.sleep(0.01)
+                assert not private.exists()
+                verifier.send_signal(signal.SIGUSR1)
+                assert verifier.wait(timeout=8) == 0
         supervisor.join(timeout=12)
         # Then its independent supervisor kills and reaps both generations and removes owned resources.
         assert supervisor.exitcode == 0
@@ -156,3 +170,7 @@ class SupervisorTests(unittest.TestCase):
     def test_normal_completion_kills_reaps_and_cleans(self):
         with tempfile.TemporaryDirectory() as directory:
             _check_supervisor_kills_reaps_and_cleans(Path(directory), "normal")
+
+    def test_cleanup_rpc_after_autonomous_deadline_has_explicit_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _check_supervisor_kills_reaps_and_cleans(Path(directory), "race")

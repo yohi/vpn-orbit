@@ -46,7 +46,8 @@ class SupervisorClient(Commands):
 
     def request(self, op: str, *, args: list[str] | None = None,
                 data: str | None = None, timeout_s: float = 5.0) -> Reply:
-        self.channel.settimeout(min(12.0, max(0.001, self.deadline - time.monotonic())))
+        deadline = self.resources.deadline + 15 if op in ("stop", "cleanup") else self.deadline
+        self.channel.settimeout(min(15.0, max(0.001, deadline - time.monotonic())))
         self.channel.send(json.dumps({"op": op, "args": args, "data": data, "timeout_s": timeout_s}).encode())
         raw = json.loads(self.channel.recv(65536))
         return {"ok": raw.get("ok", False), "code": raw.get("code"),
@@ -67,10 +68,10 @@ class SupervisorClient(Commands):
         return base64.b64decode(reply["stdout"], validate=True)
 
     def finish(self) -> bool:
-        self.deadline = time.monotonic() + 12
+        cleanup_deadline = self.resources.deadline + 15
         try:
             reply = self.request("cleanup")
-            self.proc.wait(timeout=max(0.001, self.deadline - time.monotonic()))
+            self.proc.wait(timeout=max(0.001, cleanup_deadline - time.monotonic()))
             return reply.get("ok", False) and self.proc.returncode == 0
         finally:
             self.channel.close()

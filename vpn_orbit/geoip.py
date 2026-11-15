@@ -70,6 +70,8 @@ def lookup_geoip(ip: str, *, api_key: str, timeout_s: float = 5.0) -> GeoDecisio
     Any non-200 response, error field, malformed JSON, timeout, oversized body,
     or exception yields GeoDecision.UNKNOWN. Secrets are never emitted.
     """
+    if not api_key.strip():
+        return GeoDecision.UNKNOWN
     try:
         body = json.dumps({"q": ip, "key": api_key}, separators=(",", ":")).encode("utf-8")
         request = urllib.request.Request(

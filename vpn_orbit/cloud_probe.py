@@ -77,7 +77,7 @@ class ScreenedCandidate:
 
 _FIXED_PIN_IPS: frozenset[str] = frozenset({"119.105.93.237", "126.234.242.57"})
 _PROTOCOL_QUOTA = 20
-_MAX_SCAN_WINDOW = 1000
+_SCAN_WINDOW = 40
 
 
 def _to_ip_int(ip: str) -> int:
@@ -93,8 +93,8 @@ def screen_candidates(
     limit: int = 10,
 ) -> list[ScreenedCandidate]:
     """Return a deterministic shortlist of screened VPN Gate candidates."""
-    if not 1 <= scan_window <= _MAX_SCAN_WINDOW:
-        raise ValueError(f"scan_window must be between 1 and {_MAX_SCAN_WINDOW}")
+    if scan_window != _SCAN_WINDOW:
+        raise ValueError("Stage 1 scan_window must be 40")
     if not 1 <= limit <= 10:
         raise ValueError("limit must be between 1 and 10")
 
@@ -201,7 +201,7 @@ class _SummaryParser(argparse.ArgumentParser):
 def main(argv: list[str] | None = None) -> int:
     """Run the bounded feasibility check, emitting one redacted JSON object only."""
     parser = _SummaryParser(add_help=False, allow_abbrev=False)
-    parser.add_argument("--scan-window", type=int, default=40, choices=range(1, 1001))
+    parser.add_argument("--scan-window", type=int, default=40, choices=(40,))
     parser.add_argument("--limit", type=int, default=10, choices=range(1, 11))
     parser.add_argument("--timeout-seconds", type=int, default=60, choices=range(1, 61))
     try:
@@ -211,6 +211,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if any(name in os.environ for name in ("VPN_ORBIT_USERNAME", "VPN_ORBIT_PASSWORD")):
             summary = ProbeSummary("BLOCKED", reason_codes=("environment_secret_inheritance_rejected",))
+        elif not os.environ.get("IPAPI_IS_API_KEY", "").strip():
+            summary = ProbeSummary("BLOCKED", reason_codes=("geoip_api_key_missing",))
         else:
             try:
                 api_key = os.environ.get("IPAPI_IS_API_KEY", "")

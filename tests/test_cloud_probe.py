@@ -354,14 +354,17 @@ class CloudProbeCliTests(unittest.TestCase):
 
     def invoke(self, results=(), *, error=None, args=None, env=None):
         output, errors = io.StringIO(), io.StringIO()
-        with patch.dict(os.environ, env or {}, clear=True), \
-                patch.object(cloud_probe, "fetch_catalog", return_value="catalog"), \
+        with patch.dict(os.environ, {"IPAPI_IS_API_KEY": "test-key"} if env is None else env, clear=True), \
+                patch.object(cloud_probe, "fetch_catalog", return_value="catalog") as fetch, \
                 patch.object(cloud_probe, "screen_candidates", return_value=[]) as screen, \
                 patch.object(cloud_probe, "probe_candidates", return_value=list(results), side_effect=error) as probe, \
                 redirect_stdout(output), redirect_stderr(errors):
             code = cloud_probe.main(self.args if args is None else args)
             if probe.called:
                 self.assertEqual(probe.call_args.kwargs["timeout_s"], 60)
+            if not screen.called:
+                fetch.assert_not_called()
+                probe.assert_not_called()
         self.assertEqual(errors.getvalue(), "")
         return code, json.loads(output.getvalue()), screen
 
@@ -403,6 +406,26 @@ class CloudProbeCliTests(unittest.TestCase):
                 code, summary, screen = self.invoke(env={name: ""})
                 self.assertEqual((code, summary["status"]), (1, "BLOCKED"))
                 self.assertEqual(summary["reason_codes"], ["environment_secret_inheritance_rejected"])
+                screen.assert_not_called()
+
+    def test_missing_key_blocks_before_any_network_or_probe(self):
+        for env in ({}, {"IPAPI_IS_API_KEY": ""}, {"IPAPI_IS_API_KEY": "  "}):
+            with self.subTest(env=env), patch.object(cloud_probe, "lookup_geoip") as lookup:
+                code, summary, screen = self.invoke(env=env)
+                self.assertEqual((code, summary["status"], summary["reason_codes"]),
+                                 (1, "BLOCKED", ["geoip_api_key_missing"]))
+                lookup.assert_not_called()
+                screen.assert_not_called()
+
+    def test_stage1_window_is_fixed_at_api_and_cli_boundaries(self):
+        for window in (1, 10, 41):
+            with self.subTest(window=window):
+                with self.assertRaises(ValueError):
+                    screen_candidates(_catalog([("8.8.8.8", "JP", 1, _profile())]), existing_pins=frozenset(),
+                                      geo_lookup=lambda ip: GeoDecision.UNKNOWN, scan_window=window)
+                code, summary, screen = self.invoke(args=["--scan-window", str(window)])
+                self.assertEqual((code, summary["status"], summary["reason_codes"]),
+                                 (1, "BLOCKED", ["invalid_arguments"]))
                 screen.assert_not_called()
 
     def test_invalid_arguments_emit_redacted_json(self):
