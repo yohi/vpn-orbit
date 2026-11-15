@@ -131,15 +131,19 @@ class ScreenCandidatesTests(unittest.TestCase):
         self.assertEqual(len(set(calls)), 40)
 
     def test_catalog_rank_tie_break_within_same_round_and_geo(self):
+        # parse_catalog sorts by ping ascending, so we assign pings in reverse
+        # IP order to make catalog_rank order the opposite of IP ascending order.
+        # This discriminates catalog_rank from the downstream ip_int tie-breaker.
         rows = [
+            ("1.1.1.1", "JP", 3, _profile("1.1.1.1", 1195, "udp")),
             ("1.1.1.2", "JP", 2, _profile("1.1.1.2", 1195, "udp")),
-            ("1.1.1.3", "JP", 3, _profile("1.1.1.3", 1195, "udp")),
-            ("1.1.1.1", "JP", 1, _profile("1.1.1.1", 1195, "udp")),
+            ("1.1.1.3", "JP", 1, _profile("1.1.1.3", 1195, "udp")),
         ]
         decisions = {"1.1.1.1": GeoDecision.TOKYO, "1.1.1.2": GeoDecision.TOKYO, "1.1.1.3": GeoDecision.TOKYO}
         lookup, _ = _geo(decisions)
         result = screen_candidates(_catalog(rows), existing_pins=frozenset(), geo_lookup=lookup, limit=3)
-        self.assertEqual([r.remote.ip for r in result], ["1.1.1.1", "1.1.1.2", "1.1.1.3"])
+        # catalog_rank: 1.1.1.3=1, 1.1.1.2=2, 1.1.1.1=3
+        self.assertEqual([r.remote.ip for r in result], ["1.1.1.3", "1.1.1.2", "1.1.1.1"])
 
     def test_scan_window_upper_bound_enforced(self):
         with self.assertRaises(ValueError):
