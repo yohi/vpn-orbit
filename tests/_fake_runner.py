@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from vpn_orbit.runner import CurlOutcome, IsolationResources, ProcessHandle
 
@@ -26,6 +25,9 @@ class _FakeProcess:
 
     def kill(self) -> None:
         self.killed = True
+
+    def wait(self, timeout: float) -> int:
+        return 0
 
 
 @dataclass
@@ -70,20 +72,12 @@ class FakeRunner:
         self, remote_ip: str, protocol: str, port: int, private_dir: Path
     ) -> IsolationResources:
         self.last_setup = (remote_ip, protocol, port)
-        self.commands.append(f"ip netns add test-ns")
+        self.commands.append("ip netns add test-ns")
         self.commands.append("ip link add veth0 type veth peer veth1")
         self.commands.append(f"ip route add {remote_ip}/32 via 10.200.1.1")
         if not self.has_default_route:
             self.commands.append("default route absent")
-        self._resources = IsolationResources(
-            netns="test-ns",
-            private_dir=private_dir,
-            veth_host="veth0",
-            veth_ns="veth1",
-            remote_ip=remote_ip,
-            protocol=protocol,
-            port=port,
-        )
+        assert self._resources is not None
         return self._resources
 
     def teardown_isolation(self, resources: IsolationResources) -> tuple[bool, str]:
@@ -98,6 +92,7 @@ class FakeRunner:
         if self.supervisor_start_fails:
             return False, "supervisor failed to start"
         self.supervisor_started = True
+        self._resources = resources
         self.commands.append("supervisor started")
         return True, ""
 
@@ -156,6 +151,10 @@ class FakeRunner:
     def host_default_route_unchanged(self) -> tuple[bool, str]:
         self.commands.append("host default route check")
         return (not self.host_route_modified, "")
+
+    def host_direct_route_rejected(self, echo_ip: str, resources: IsolationResources,
+                                  deadline: float) -> tuple[bool, str]:
+        return True, "direct_route_rejected"
 
     def save_host_ip_forward(self) -> tuple[bool, str]:
         self.ip_forward_saved = True

@@ -1,0 +1,95 @@
+import ipaddress
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+from .probe_commands import Commands, IsolationUnavailable
+from .runner_types import IsolationResources
+
+
+def ns_command(resources: IsolationResources, *args: str) -> list[str]:
+    return ["ip", "netns", "exec", resources.netns, *args]
+
+
+def provision(resources: IsolationResources, commands: Commands) -> None:
+    r = resources
+    addresses = json.loads(commands.checked(["ip", "-j", "-4", "addr", "show"]))
+    for link in addresses:
+        for addr in link.get("addr_info", []):
+            network = ipaddress.ip_network(f"{addr['local']}/{addr['prefixlen']}", strict=False)
+            if network.overlaps(ipaddress.ip_network("10.253.240.0/30")):
+                raise IsolationUnavailable("isolation address conflict")
+    routes = json.loads(commands.checked(["ip", "-j", "-4", "route", "show", "table", "all"]))
+    if any(row.get("dst") != "default" and ipaddress.ip_network(row["dst"], strict=False).overlaps(
+            ipaddress.ip_network("10.253.240.0/30")) for row in routes if "dst" in row):
+        raise IsolationUnavailable("isolation route conflict")
+    route = json.loads(commands.checked(["ip", "-j", "-4", "route", "get", r.remote_ip]))
+    wan = route[0]["dev"]
+    if not wan.replace("-", "").replace("_", "").replace(".", "").isalnum():
+        raise IsolationUnavailable("invalid interface")
+    commands.checked(["ip", "netns", "add", r.netns])
+    commands.checked(["ip", "link", "add", r.veth_host, "type", "veth", "peer", "name", r.veth_ns])
+    commands.checked(["ip", "link", "set", r.veth_ns, "netns", r.netns])
+    commands.checked(["ip", "addr", "add", "10.253.240.1/30", "dev", r.veth_host])
+    commands.checked(ns_command(r, "ip", "addr", "add", "10.253.240.2/30", "dev", r.veth_ns))
+    commands.checked(ns_command(r, "ip", "link", "set", "lo", "up"))
+    commands.checked(ns_command(r, "ip", "link", "set", r.veth_ns, "up"))
+    commands.checked(ns_command(r, "ip", "-4", "route", "add", r.remote_ip + "/32",
+                                "via", "10.253.240.1", "dev", r.veth_ns))
+    host_rules = f'''table inet {r.table} {{
+ chain input {{ type filter hook input priority -200; policy accept;
+  iifname "{r.veth_host}" drop
+ }}
+ chain forward {{ type filter hook forward priority -200; policy accept;
+  iifname "{r.veth_host}" oifname "{wan}" ip saddr 10.253.240.2 ip daddr {r.remote_ip} {r.protocol} dport {r.port} accept
+  iifname "{wan}" oifname "{r.veth_host}" ip saddr {r.remote_ip} ip daddr 10.253.240.2 {r.protocol} sport {r.port} ct state established,related accept
+  iifname "{r.veth_host}" drop
+  oifname "{r.veth_host}" drop
+ }}
+ chain postrouting {{ type nat hook postrouting priority srcnat; policy accept;
+  oifname "{wan}" ip saddr 10.253.240.2 ip daddr {r.remote_ip} {r.protocol} dport {r.port} masquerade
+ }}
+}}'''
+    namespace_rules = f'''table inet {r.table} {{
+ chain input {{ type filter hook input priority -200; policy drop;
+  iifname "lo" accept
+  iifname "{r.veth_ns}" ip saddr {r.remote_ip} {r.protocol} sport {r.port} ct state established accept
+ }}
+ chain output {{ type filter hook output priority -200; policy drop;
+  oifname "lo" accept
+  oifname "{r.veth_ns}" ip daddr {r.remote_ip} {r.protocol} dport {r.port} accept
+ }}
+}}'''
+    commands.checked(["nft", "-f", "-"], data=host_rules)
+    commands.checked(ns_command(r, "nft", "-f", "-"), data=namespace_rules)
+    Path("/proc/sys/net/ipv4/ip_forward").write_text("1")
+    commands.checked(["ip", "link", "set", r.veth_host, "up"])
+
+
+def remove_resources(r: IsolationResources, commands: Commands) -> bool:
+    """Confirm absence: unlike ordinary deletion, this is the PASS safety contract."""
+    ok = True
+    for args in (["nft", "delete", "table", "inet", r.table],
+                 ["ip", "link", "del", r.veth_host], ["ip", "netns", "del", r.netns]):
+        try:
+            commands.run(args)
+        except (OSError, TimeoutError, subprocess.SubprocessError):
+            ok = False
+    try:
+        if r.host_ip_forward_original is not None:
+            Path("/proc/sys/net/ipv4/ip_forward").write_text(r.host_ip_forward_original)
+        shutil.rmtree(r.private_dir)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        ok = False
+    try:
+        ok = commands.run(["ip", "link", "show", r.veth_host]).returncode != 0 and ok
+        ok = commands.run(["nft", "list", "table", "inet", r.table]).returncode != 0 and ok
+        namespaces = commands.checked(["ip", "netns", "list"])
+        ok = r.netns not in {line.split()[0] for line in namespaces.splitlines() if line.split()} and ok
+        ok = not r.private_dir.exists() and ok
+    except (OSError, RuntimeError, TimeoutError, subprocess.SubprocessError):
+        ok = False
+    return ok

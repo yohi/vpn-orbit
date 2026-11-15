@@ -7,13 +7,14 @@ passed to ``openvpn --config``.
 from __future__ import annotations
 
 import os
-import re
 import shlex
-import subprocess
 from pathlib import Path
 from typing import Any
 
-from .phase1 import AUTHS, CIPHERS, UnsupportedProfile
+from .config_validation import quote_word as _quote_word
+from .config_validation import spki_match as _spki_match
+from .config_validation import validate_pem as _validate_pem
+from .phase1 import AUTHS, CIPHERS, UnsupportedProfile, require_global_ipv4
 
 _ALLOWED_ENDPOINT_KEYS: frozenset[str] = frozenset({
     "type", "tag", "mode", "server", "server_port", "network",
@@ -36,55 +37,6 @@ def _write_private_file(path: Path, data: bytes) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as file:
         file.write(data)
-
-
-def _validate_pem(ca: str) -> None:
-    """Validate that a string is a well-formed PEM certificate."""
-    from ssl import PEM_cert_to_DER_cert
-    normalized = ca.strip()
-    if not normalized.startswith("-----BEGIN CERTIFICATE-----"):
-        raise UnsupportedProfile("CA element is not a PEM certificate")
-    try:
-        PEM_cert_to_DER_cert(normalized)
-    except ValueError as exc:
-        raise UnsupportedProfile("malformed CA PEM") from exc
-
-
-def _spki_match(cert_pem: bytes, key_pem: bytes, timeout_s: float = 10.0) -> tuple[bool, str]:
-    """Compare the public keys of a cert and a private key using OpenSSL."""
-    try:
-        cert_pub = subprocess.run(
-            ["openssl", "x509", "-pubkey", "-noout"],
-            input=cert_pem,
-            capture_output=True,
-            timeout=timeout_s,
-            check=True,
-        ).stdout
-        pub_der = subprocess.run(
-            ["openssl", "pkey", "-pubin", "-outform", "DER"],
-            input=cert_pub,
-            capture_output=True,
-            timeout=timeout_s,
-            check=True,
-        ).stdout
-        key_der = subprocess.run(
-            ["openssl", "pkey", "-pubout", "-outform", "DER"],
-            input=key_pem,
-            capture_output=True,
-            timeout=timeout_s,
-            check=True,
-        ).stdout
-    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
-        return False, "SPKI comparison failed"
-    return pub_der == key_der, ""
-
-
-def _quote_word(value: str) -> str:
-    """Return a double-quoted word if it contains whitespace or quotes."""
-    if re.search(r'[\s"]', value):
-        escaped = value.replace('"', '\\"')
-        return f'"{escaped}"'
-    return value
 
 
 def synthesize_openvpn_config(
@@ -115,6 +67,7 @@ def synthesize_openvpn_config(
 
     if parsed_endpoint.get("type") != "openvpn-client":
         raise UnsupportedProfile("only openvpn-client endpoints are supported")
+    require_global_ipv4(remote_ip)
 
     if protocol not in ("tcp", "udp"):
         raise UnsupportedProfile(f"unsupported probe protocol: {protocol}")
@@ -125,7 +78,8 @@ def synthesize_openvpn_config(
 
     endpoint_server = parsed_endpoint.get("server")
     endpoint_port = parsed_endpoint.get("server_port")
-    if endpoint_server != remote_ip or endpoint_port != port:
+    if (endpoint_server != remote_ip or type(endpoint_port) is not int or
+            endpoint_port != port or not 1 <= port <= 65535):
         raise UnsupportedProfile("synthesized remote does not match parsed endpoint")
 
     tls = parsed_endpoint.get("tls")
@@ -170,15 +124,21 @@ def synthesize_openvpn_config(
         raise UnsupportedProfile("remote-cert-tls must be server")
     if remote_cert_tls is None and remote_cert_eku is None:
         raise UnsupportedProfile("server identity verification required")
+    if remote_cert_eku is not None and remote_cert_eku not in ("TLS Web Server Authentication", "1.3.6.1.5.5.7.3.1"):
+        raise UnsupportedProfile("unsupported server EKU")
 
     server_name = tls.get("server_name")
     server_name_type = tls.get("server_name_type", "name")
     if server_name is not None and server_name_type not in ("name", "subject", "name-prefix"):
         raise UnsupportedProfile("unsupported verify-x509-name type")
+    if server_name is not None:
+        _quote_word(server_name)
 
     wrap = tls.get("control_wrap")
     wrap_path: str | None = None
     wrap_direction: str | None = None
+    wrap_type: str | None = None
+    key_material = ""
     if wrap is not None:
         if not isinstance(wrap, dict):
             raise UnsupportedProfile("control_wrap must be a dict")
@@ -210,20 +170,21 @@ def synthesize_openvpn_config(
     password = parsed_endpoint.get("password")
     if (username is None) != (password is None):
         raise UnsupportedProfile("username and password must be paired")
+    if username is not None and (username, password) != ("vpn", "vpn"):
+        raise UnsupportedProfile("only public default credentials supported")
 
     data_ciphers = parsed_endpoint.get("data_ciphers", [])
     if not isinstance(data_ciphers, list) or not data_ciphers:
         raise UnsupportedProfile("data_ciphers missing")
-    allowed_ciphers = {c.upper() for c in data_ciphers}
-    if not allowed_ciphers.issubset(CIPHERS):
+    if any(not isinstance(c, str) or c not in CIPHERS for c in data_ciphers):
         raise UnsupportedProfile("unsupported data-ciphers")
 
     fallback = parsed_endpoint.get("data_ciphers_fallback")
-    if not isinstance(fallback, str) or fallback.upper() not in CIPHERS:
+    if not isinstance(fallback, str) or fallback not in CIPHERS:
         raise UnsupportedProfile("unsupported data-ciphers-fallback")
 
     auth = parsed_endpoint.get("auth")
-    if not isinstance(auth, str) or auth.upper() not in AUTHS:
+    if not isinstance(auth, str) or auth not in AUTHS:
         raise UnsupportedProfile("unsupported auth")
 
     # Write files under private_dir.
@@ -231,7 +192,7 @@ def synthesize_openvpn_config(
     _write_private_file(ca_path, b"\n".join(validated_ca_certs) + b"\n")
     cert_path = private_dir / "cert.pem"
     key_path = private_dir / "key.pem"
-    if cert_pem is not None:
+    if cert_pem is not None and key_pem is not None:
         _write_private_file(cert_path, cert_pem)
         _write_private_file(key_path, key_pem)
     auth_path = private_dir / "auth.txt"
