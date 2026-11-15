@@ -15,6 +15,7 @@ from .config_validation import quote_word as _quote_word
 from .config_validation import spki_match as _spki_match
 from .config_validation import validate_pem as _validate_pem
 from .phase1 import AUTHS, CIPHERS, UnsupportedProfile, require_global_ipv4
+from .probe_commands import Commands
 
 _ALLOWED_ENDPOINT_KEYS: frozenset[str] = frozenset({
     "type", "tag", "mode", "server", "server_port", "network",
@@ -46,6 +47,7 @@ def synthesize_openvpn_config(
     port: int,
     protocol: str,
     private_dir: Path,
+    commands: Commands | None = None,
 ) -> bytes:
     """Generate a locked-down OpenVPN CLI config from a sing-box Endpoint dict.
 
@@ -55,6 +57,9 @@ def synthesize_openvpn_config(
 
     The config uses absolute paths for file directives so the OpenVPN CWD is
     not security-critical.
+
+    Live probes must supply the running supervisor's commands. Standalone calls
+    without commands have bounded subprocesses, but no caller-SIGKILL guarantee.
     """
     _reject_env_secrets()
 
@@ -96,7 +101,7 @@ def synthesize_openvpn_config(
     for item in ca_certs:
         if not isinstance(item, str):
             raise UnsupportedProfile("CA certificate must be a string")
-        _validate_pem(item)
+        _validate_pem(item, commands=commands)
         validated_ca_certs.append(item.encode())
 
     cert_pem: bytes | None = None
@@ -112,7 +117,7 @@ def synthesize_openvpn_config(
             raise UnsupportedProfile("client key missing")
         cert_pem = client_cert[0].encode()
         key_pem = client_key[0].encode()
-        matched, reason = _spki_match(cert_pem, key_pem)
+        matched, reason = _spki_match(cert_pem, key_pem, commands=commands)
         if not matched:
             raise UnsupportedProfile(f"client identity SPKI mismatch: {reason}")
 

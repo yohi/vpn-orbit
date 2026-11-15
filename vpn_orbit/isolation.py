@@ -67,29 +67,66 @@ def provision(resources: IsolationResources, commands: Commands) -> None:
     commands.checked(["ip", "link", "set", r.veth_host, "up"])
 
 
+def _present_resources(r: IsolationResources, commands: Commands) -> frozenset[str]:
+    links = json.loads(commands.checked(["ip", "-j", "link", "show"]))
+    tables = json.loads(commands.checked(["nft", "-j", "list", "tables"]))
+    if not isinstance(links, list) or not isinstance(tables, dict) or not isinstance(tables.get("nftables"), list):
+        raise IsolationUnavailable("invalid resource enumeration")
+    present: set[str] = set()
+    for link in links:
+        if not isinstance(link, dict) or not isinstance(link.get("ifname"), str):
+            raise IsolationUnavailable("invalid link enumeration")
+        if link["ifname"] == r.veth_host:
+            present.add("link")
+    for record in tables["nftables"]:
+        if not isinstance(record, dict):
+            raise IsolationUnavailable("invalid table enumeration")
+        if "table" in record:
+            table = record["table"]
+            if not isinstance(table, dict) or not isinstance(table.get("name"), str) or not isinstance(table.get("family"), str):
+                raise IsolationUnavailable("invalid table identity")
+            if table["family"] == "inet" and table["name"] == r.table:
+                present.add("table")
+        elif set(record) != {"metainfo"} or not isinstance(record["metainfo"], dict):
+            raise IsolationUnavailable("unrecognized table enumeration record")
+    namespaces = commands.checked(["ip", "netns", "list"])
+    if r.netns in {line.split()[0] for line in namespaces.splitlines() if line.split()}:
+        present.add("netns")
+    return frozenset(present)
+
+
 def remove_resources(r: IsolationResources, commands: Commands) -> bool:
-    """Confirm absence: unlike ordinary deletion, this is the PASS safety contract."""
+    """Only successful, parsed enumeration can confirm cleanup; command failure is never absence."""
     ok = True
-    for args in (["nft", "delete", "table", "inet", r.table],
-                 ["ip", "link", "del", r.veth_host], ["ip", "netns", "del", r.netns]):
+    try:
+        present = _present_resources(r, commands)
+    except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError):
+        ok = False
+        present = frozenset({"table", "link", "netns"})
+    for kind, args in (("table", ["nft", "delete", "table", "inet", r.table]),
+                       ("link", ["ip", "link", "del", r.veth_host]),
+                       ("netns", ["ip", "netns", "del", r.netns])):
+        if kind not in present:
+            continue
         try:
-            commands.run(args)
+            if commands.run(args).returncode != 0:
+                ok = False
         except (OSError, TimeoutError, subprocess.SubprocessError):
             ok = False
-    try:
-        if r.host_ip_forward_original is not None:
+    if r.host_ip_forward_original is not None:
+        try:
             Path("/proc/sys/net/ipv4/ip_forward").write_text(r.host_ip_forward_original)
+        except OSError:
+            ok = False
+    try:
         shutil.rmtree(r.private_dir)
     except FileNotFoundError:
         pass
     except OSError:
         ok = False
     try:
-        ok = commands.run(["ip", "link", "show", r.veth_host]).returncode != 0 and ok
-        ok = commands.run(["nft", "list", "table", "inet", r.table]).returncode != 0 and ok
-        namespaces = commands.checked(["ip", "netns", "list"])
-        ok = r.netns not in {line.split()[0] for line in namespaces.splitlines() if line.split()} and ok
+        ok = not _present_resources(r, commands) and ok
         ok = not r.private_dir.exists() and ok
-    except (OSError, RuntimeError, TimeoutError, subprocess.SubprocessError):
+    except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError):
         ok = False
     return ok

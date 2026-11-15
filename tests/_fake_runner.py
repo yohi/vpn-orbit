@@ -1,9 +1,11 @@
 """Test double for ProbeRunner."""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from vpn_orbit.probe_commands import Commands
 from vpn_orbit.runner import CurlOutcome, IsolationResources, ProcessHandle
 
 
@@ -67,6 +69,9 @@ class FakeRunner:
 
     def prerequisites_ok(self) -> bool:
         return self.prerequisites_ok_value
+
+    def validation_commands(self) -> Commands:
+        return Commands(time.monotonic() + 5)
 
     def setup_isolation(
         self, remote_ip: str, protocol: str, port: int, private_dir: Path

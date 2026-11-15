@@ -1,3 +1,4 @@
+import base64
 import json
 import socket
 import subprocess
@@ -44,9 +45,9 @@ class SupervisorClient(Commands):
             child.close()
 
     def request(self, op: str, *, args: list[str] | None = None,
-                data: str | None = None) -> Reply:
+                data: str | None = None, timeout_s: float = 5.0) -> Reply:
         self.channel.settimeout(min(12.0, max(0.001, self.deadline - time.monotonic())))
-        self.channel.send(json.dumps({"op": op, "args": args, "data": data}).encode())
+        self.channel.send(json.dumps({"op": op, "args": args, "data": data, "timeout_s": timeout_s}).encode())
         raw = json.loads(self.channel.recv(65536))
         return {"ok": raw.get("ok", False), "code": raw.get("code"),
                 "stdout": raw.get("stdout", ""), "pid": raw.get("pid", 0)}
@@ -57,6 +58,13 @@ class SupervisorClient(Commands):
         if code is None:
             raise RuntimeError("missing command result")
         return subprocess.CompletedProcess(args, code, reply["stdout"], "")
+
+    def openssl(self, args: Sequence[str], data: bytes, timeout_s: float) -> bytes:
+        reply = self.request("openssl", args=list(args), data=base64.b64encode(data).decode("ascii"),
+                             timeout_s=timeout_s)
+        if not reply["ok"] or reply["code"] != 0:
+            raise OSError("supervised validation failed")
+        return base64.b64decode(reply["stdout"], validate=True)
 
     def finish(self) -> bool:
         self.deadline = time.monotonic() + 12

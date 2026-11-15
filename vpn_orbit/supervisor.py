@@ -1,6 +1,7 @@
 """Independent owner of OpenVPN, command children, and privileged cleanup."""
 from __future__ import annotations
 
+import base64
 import ctypes
 import json
 import os
@@ -75,6 +76,13 @@ def serve(channel: socket.socket, resources: IsolationResources) -> None:
                 case "run":
                     result = commands.run(request["args"], data=request.get("data"))
                     reply = {"ok": True, "code": result.returncode, "stdout": result.stdout}
+                case "openssl":
+                    try:
+                        output = commands.openssl(request["args"], base64.b64decode(request["data"], validate=True),
+                                                  float(request["timeout_s"]))
+                        reply = {"ok": True, "code": 0, "stdout": base64.b64encode(output).decode("ascii")}
+                    except (OSError, TimeoutError, ValueError, RuntimeError, subprocess.SubprocessError):
+                        reply = {"ok": False}
                 case "start":
                     log_path = resources.private_dir / "openvpn.log"
                     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

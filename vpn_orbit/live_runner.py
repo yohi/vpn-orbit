@@ -25,6 +25,11 @@ class SubprocessRunner:
         return os.geteuid() == 0 and Path("/dev/net/tun").exists() and all(
             shutil.which(binary) for binary in ("ip", "nft", "openvpn", "curl", "openssl", "getent"))
 
+    def validation_commands(self) -> Commands:
+        if self.client is None:
+            raise RuntimeError("validation requires supervisor ownership")
+        return self.client
+
     def start_supervisor(self, resources: IsolationResources) -> tuple[bool, str]:
         self.resources = resources
         self.client = SupervisorClient(resources)

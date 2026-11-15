@@ -5,10 +5,10 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+import unittest
 from pathlib import Path
-
-import pytest
 
 from vpn_orbit.runner_types import IsolationResources
 from vpn_orbit.supervisor import serve
@@ -27,12 +27,14 @@ def _tools(tmp_path):
     binary_dir.mkdir()
     tool = binary_dir / "tool"
     tool.write_text(f"#!{sys.executable}\n" + '''
-import os, signal, socket, subprocess, sys
+import json, os, signal, socket, subprocess, sys
 from pathlib import Path
 root = Path(os.environ["VPN_TEST_STATE"])
 args = sys.argv[1:]
 name = Path(sys.argv[0]).name
-if name == "openvpn":
+if name in ("openvpn", "openssl"):
+    (root / (name + ".pid")).write_text(str(os.getpid()))
+    (root / (name + ".parent")).write_text(str(os.getppid()))
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     child = subprocess.Popen([sys.executable, "-c", "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); signal.pause()"], stdout=subprocess.PIPE)
     child.stdout.readline()
@@ -49,21 +51,23 @@ elif name == "ip" and args[:2] == ["netns", "list"]:
     print("vo-test" if (root / "netns").exists() else "")
 elif name == "ip" and args[:2] == ["link", "del"]:
     (root / "veth").unlink(missing_ok=True)
-elif name == "ip" and args[:2] == ["link", "show"]:
-    sys.exit(0 if (root / "veth").exists() else 1)
+elif name == "ip" and args == ["-j", "link", "show"]:
+    print(json.dumps([{"ifname":"vh-test"}] if (root / "veth").exists() else []))
 elif name == "nft" and args[0] == "delete":
     (root / "nft").unlink(missing_ok=True)
-elif name == "nft" and args[0] == "list":
-    sys.exit(0 if (root / "nft").exists() else 1)
+elif name == "nft" and args == ["-j", "list", "tables"]:
+    if (root / "deny_confirmation").exists():
+        sys.exit(1)
+    print(json.dumps({"nftables":[{"table":{"family":"inet", "name":(root / "nft").read_text()}}]
+                     if (root / "nft").exists() else []}))
 ''')
     tool.chmod(0o700)
-    for name in ("ip", "nft", "openvpn"):
+    for name in ("ip", "nft", "openvpn", "openssl"):
         (binary_dir / name).symlink_to(tool)
     return binary_dir
 
 
-@pytest.mark.parametrize("termination", ["sigkill", "deadline", "normal"])
-def test_supervisor_kills_reaps_and_cleans(tmp_path, termination):
+def _check_supervisor_kills_reaps_and_cleans(tmp_path, termination):
     # Given real supervisor and verifier processes, with OS network calls sandboxed at executable boundaries.
     binaries = _tools(tmp_path)
     private = tmp_path / "private"
@@ -74,6 +78,7 @@ def test_supervisor_kills_reaps_and_cleans(tmp_path, termination):
     r = IsolationResources(netns="vo-test", private_dir=private, veth_host="vh-test",
         veth_ns="vn-test", remote_ip="8.8.8.8", protocol="udp", port=1195)
     r.deadline = time.monotonic() + (1 if termination == "deadline" else 20)
+    (tmp_path / "nft").write_text(r.table)
     listener = socket.socket(socket.AF_UNIX)
     listener.bind(str(tmp_path / "ready.sock"))
     listener.listen(1)
@@ -137,3 +142,17 @@ with socket.socket(fileno=int(sys.argv[1])) as channel:
             supervisor.join(timeout=2)
         output.close()
         listener.close()
+
+
+class SupervisorTests(unittest.TestCase):
+    def test_sigkill_owner_kills_reaps_and_cleans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _check_supervisor_kills_reaps_and_cleans(Path(directory), "sigkill")
+
+    def test_deadline_kills_reaps_and_cleans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _check_supervisor_kills_reaps_and_cleans(Path(directory), "deadline")
+
+    def test_normal_completion_kills_reaps_and_cleans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _check_supervisor_kills_reaps_and_cleans(Path(directory), "normal")

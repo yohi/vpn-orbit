@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .probe_commands import Commands
+
 
 @dataclass(frozen=True, slots=True)
 class CurlOutcome:
@@ -83,6 +85,7 @@ class ProbeRunner(Protocol):
     """Adapter for privileged operations, commands, time, and cleanup."""
 
     def prerequisites_ok(self) -> bool: ...
+    def validation_commands(self) -> Commands: ...
     def setup_isolation(
         self, remote_ip: str, protocol: str, port: int, private_dir: Path
     ) -> IsolationResources: ...

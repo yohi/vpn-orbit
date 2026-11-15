@@ -72,7 +72,7 @@ def probe_one(candidate: ScreenedCandidate, *, geo_lookup: Callable[[str], GeoDe
         try:
             config = synthesize_openvpn_config(endpoint, remote_ip=candidate.remote.ip,
                 port=candidate.remote.port, protocol=candidate.remote.protocol,
-                private_dir=private_dir)
+                private_dir=private_dir, commands=runner.validation_commands())
         except UnsupportedProfile:
             return ProbeStatus.NOT_VERIFIED, "config_synthesis_failed", None
         try:
