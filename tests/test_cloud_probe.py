@@ -4,6 +4,8 @@ from __future__ import annotations
 import base64
 import csv
 import io
+import shutil
+import tempfile
 from pathlib import Path
 import unittest
 
@@ -18,6 +20,7 @@ from vpn_orbit.cloud_probe import (
     screen_candidates,
 )
 from vpn_orbit.phase1 import Candidate
+from tests._fake_runner import FakeRunner
 
 CA = (Path(__file__).parent / "fixtures" / "test-ca.pem").read_text()
 
@@ -301,7 +304,7 @@ class ProbeCandidatesTests(unittest.TestCase):
         results = probe_candidates([], geo_lookup=lambda ip: GeoDecision.UNKNOWN)
         self.assertEqual(results, [])
 
-    def test_probe_candidates_aggregates_to_not_verified_when_all_blocked(self):
+    def test_probe_candidates_returns_blocked_when_prerequisites_unavailable(self):
         ca = (Path(__file__).parent / "fixtures" / "test-ca.pem").read_text()
         profile = f"""client
 proto udp
@@ -321,15 +324,13 @@ remote-cert-tls server
             ingress_geo=GeoDecision.TOKYO,
             catalog_rank=1,
         )
-        class NoopRunner:
-            def prerequisites_ok(self):
-                return False
-            def setup_isolation(self, *args, **kwargs):
-                raise AssertionError("should not be called")
-        results = probe_candidates([candidate], geo_lookup=lambda ip: GeoDecision.UNKNOWN, runner=NoopRunner())
+        runner = FakeRunner(Path(tempfile.mkdtemp(prefix="vpn-orbit-cloud-probe-")))
+        runner.prerequisites_ok_value = False
+        results = probe_candidates([candidate], geo_lookup=lambda ip: GeoDecision.UNKNOWN, runner=runner)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].status, ProbeStatus.BLOCKED)
         self.assertEqual(aggregate_status(r.status for r in results), ProbeStatus.BLOCKED)
+        shutil.rmtree(runner.tmp, ignore_errors=True)
 
     def test_probe_result_is_typed_value_object(self):
         result = ProbeResult(

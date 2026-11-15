@@ -1,26 +1,21 @@
 """Tests for isolated OpenVPN tunnel verifier."""
 from __future__ import annotations
 
-import base64
 import os
 import shutil
 import subprocess
 import tempfile
 import unittest
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from vpn_orbit.cloud_probe import ProbeStatus, ScreenedCandidate
+from tests._fake_runner import FakeRunner
+from vpn_orbit.cloud_probe import ProbeStatus, RemoteKey, ScreenedCandidate
 from vpn_orbit.geoip import GeoDecision
-from vpn_orbit.openvpn_probe import (
-    ProbeResult,
-    FakeRunner,
-    probe_one,
-    synthesize_openvpn_config,
-)
+from vpn_orbit.openvpn_probe import ProbeResult, probe_candidates, probe_one, synthesize_openvpn_config
 from vpn_orbit.phase1 import Candidate, UnsupportedProfile
+from vpn_orbit.runner import CurlOutcome
 
 
 def _openssl_cmd(args: list[str], *, input_data: bytes | None = None) -> bytes:
@@ -71,7 +66,7 @@ def _endpoint(
     auth: str = "SHA1",
 ) -> dict[str, Any]:
     if ca is None:
-        ca = "-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJAKHBfpE\n-----END CERTIFICATE-----\n"
+        ca, _ = _generate_cert_key(Path(tempfile.mkdtemp()), "default-ca")
     tls: dict[str, Any] = {"certificate": [ca]}
     if remote_cert_eku:
         tls["remote_certificate_eku"] = remote_cert_eku
@@ -135,7 +130,9 @@ class ConfigSynthesisTests(unittest.TestCase):
         files = self._files()
         self.assertIn("ca.pem", files)
         self.assertEqual(files["ca.pem"].stat().st_mode & 0o777, 0o600)
-        self.assertIn("ca ca.pem", config.decode())
+        text = config.decode()
+        self.assertIn("ca ", text)
+        self.assertIn("ca.pem", text)
 
     def test_cert_and_key_files_written(self):
         cert, key = _generate_cert_key(self.tmp)
@@ -144,8 +141,9 @@ class ConfigSynthesisTests(unittest.TestCase):
         self.assertIn("cert.pem", files)
         self.assertIn("key.pem", files)
         self.assertEqual(files["cert.pem"].stat().st_mode & 0o777, 0o600)
-        self.assertIn("cert cert.pem", config.decode())
-        self.assertIn("key key.pem", config.decode())
+        text = config.decode()
+        self.assertIn("cert ", text)
+        self.assertIn("key ", text)
 
     def test_auth_user_pass_file_written_when_credentials_present(self):
         cert, key = _generate_cert_key(self.tmp)
@@ -154,7 +152,7 @@ class ConfigSynthesisTests(unittest.TestCase):
         self.assertIn("auth.txt", files)
         content = files["auth.txt"].read_text()
         self.assertEqual(content.strip(), "vpn\nvpn")
-        self.assertIn("auth-user-pass auth.txt", config.decode())
+        self.assertIn("auth-user-pass", config.decode())
 
     def test_data_ciphers_and_fallback_preserved(self):
         ca, _ = _generate_cert_key(self.tmp)
@@ -176,7 +174,7 @@ class ConfigSynthesisTests(unittest.TestCase):
     def test_remote_cert_eku_preserved(self):
         ca, _ = _generate_cert_key(self.tmp)
         config = self._synthesize(_endpoint(ca=ca, remote_cert_eku="TLS Web Server Authentication"))
-        self.assertIn("remote-cert-eku \"TLS Web Server Authentication\"", config.decode())
+        self.assertIn('remote-cert-eku "TLS Web Server Authentication"', config.decode())
 
     def test_verify_x509_name_preserved(self):
         ca, _ = _generate_cert_key(self.tmp)
@@ -187,27 +185,35 @@ class ConfigSynthesisTests(unittest.TestCase):
         ca, _ = _generate_cert_key(self.tmp)
         wrap = {"type": "tls_auth", "key": _static_key(), "direction": "client"}
         config = self._synthesize(_endpoint(ca=ca, control_wrap=wrap))
-        self.assertIn("tls-auth tls-auth.key 1", config.decode())
+        lines = [line for line in config.decode().splitlines() if line.startswith("tls-auth ")]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].endswith(" 1"))
 
     def test_tls_auth_server_direction(self):
         ca, _ = _generate_cert_key(self.tmp)
         wrap = {"type": "tls_auth", "key": _static_key(), "direction": "server"}
         config = self._synthesize(_endpoint(ca=ca, control_wrap=wrap))
-        self.assertIn("tls-auth tls-auth.key 0", config.decode())
+        lines = [line for line in config.decode().splitlines() if line.startswith("tls-auth ")]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].endswith(" 0"))
 
     def test_tls_auth_absent_direction(self):
         ca, _ = _generate_cert_key(self.tmp)
         wrap = {"type": "tls_auth", "key": _static_key()}
         config = self._synthesize(_endpoint(ca=ca, control_wrap=wrap))
-        self.assertIn("tls-auth tls-auth.key", config.decode())
-        self.assertNotIn("tls-auth tls-auth.key 1", config.decode())
-        self.assertNotIn("tls-auth tls-auth.key 0", config.decode())
+        lines = [line for line in config.decode().splitlines() if line.startswith("tls-auth ")]
+        self.assertEqual(len(lines), 1)
+        parts = lines[0].split()
+        self.assertEqual(len(parts), 2)
 
     def test_tls_crypt_has_no_direction(self):
         ca, _ = _generate_cert_key(self.tmp)
         wrap = {"type": "tls_crypt", "key": _static_key()}
         config = self._synthesize(_endpoint(ca=ca, control_wrap=wrap))
-        self.assertIn("tls-crypt tls-crypt.key", config.decode())
+        lines = [line for line in config.decode().splitlines() if line.startswith("tls-crypt ")]
+        self.assertEqual(len(lines), 1)
+        parts = lines[0].split()
+        self.assertEqual(len(parts), 2)
 
     def test_tls_crypt_with_direction_rejected(self):
         ca, _ = _generate_cert_key(self.tmp)
@@ -252,6 +258,35 @@ class ConfigSynthesisTests(unittest.TestCase):
         with self.assertRaises(UnsupportedProfile):
             self._synthesize(endpoint)
 
+    def test_remote_mismatch_rejected(self):
+        ca, _ = _generate_cert_key(self.tmp)
+        with self.assertRaises(UnsupportedProfile):
+            self._synthesize(_endpoint(ca=ca), remote_ip="1.1.1.1")
+
+    def test_remote_certificate_tls_must_be_server(self):
+        ca, _ = _generate_cert_key(self.tmp)
+        endpoint = _endpoint(ca=ca)
+        endpoint["tls"]["remote_certificate_tls"] = "client"
+        with self.assertRaises(UnsupportedProfile):
+            self._synthesize(endpoint)
+
+    def test_server_identity_verification_required(self):
+        ca, _ = _generate_cert_key(self.tmp)
+        endpoint = _endpoint(ca=ca)
+        del endpoint["tls"]["remote_certificate_tls"]
+        with self.assertRaises(UnsupportedProfile):
+            self._synthesize(endpoint)
+
+    def test_unsupported_data_ciphers_rejected(self):
+        ca, _ = _generate_cert_key(self.tmp)
+        with self.assertRaises(UnsupportedProfile):
+            self._synthesize(_endpoint(ca=ca, data_ciphers=["BLOWFISH-CBC"]))
+
+    def test_unsupported_auth_rejected(self):
+        ca, _ = _generate_cert_key(self.tmp)
+        with self.assertRaises(UnsupportedProfile):
+            self._synthesize(_endpoint(ca=ca, auth="MD5"))
+
     def test_no_raw_ovpn_passed_to_openvpn(self):
         ca, _ = _generate_cert_key(self.tmp)
         config = self._synthesize(_endpoint(ca=ca))
@@ -261,23 +296,30 @@ class ConfigSynthesisTests(unittest.TestCase):
         self.assertIn("client", text)
         self.assertIn("route-nopull", text)
 
-    def test_private_dir_files_are_under_private_dir_only(self):
-        cert, key = _generate_cert_key(self.tmp)
-        config = self._synthesize(_endpoint(cert=cert, key=key))
+    def test_uses_tun0(self):
+        ca, _ = _generate_cert_key(self.tmp)
+        config = self._synthesize(_endpoint(ca=ca))
+        lines = [line for line in config.decode().splitlines() if line.startswith("dev ")]
+        self.assertEqual(lines, ["dev tun0"])
+
+    def test_paths_are_absolute(self):
+        ca, _ = _generate_cert_key(self.tmp)
+        config = self._synthesize(_endpoint(ca=ca))
         text = config.decode()
         private_dir = self.tmp / "private"
         for line in text.splitlines():
             if line.startswith(("ca ", "cert ", "key ", "tls-auth ", "tls-crypt ", "auth-user-pass ")):
-                path = private_dir / line.split(None, 1)[1].split()[0].strip('"')
-                self.assertTrue(path.is_relative_to(private_dir), line)
+                path_str = line.split(None, 1)[1].split()[0].strip('"')
+                self.assertTrue(Path(path_str).is_absolute(), line)
+                self.assertTrue(Path(path_str).is_relative_to(private_dir.resolve()), line)
 
     def test_error_messages_do_not_contain_private_key(self):
         cert, key = _mismatched_cert_key(self.tmp)
-        try:
+        with self.assertRaises(UnsupportedProfile) as ctx:
             self._synthesize(_endpoint(cert=cert, key=key))
-        except UnsupportedProfile as exc:
-            self.assertNotIn("BEGIN", str(exc))
-            self.assertNotIn("KEY", str(exc).upper())
+        message = str(ctx.exception)
+        self.assertNotIn("BEGIN", message)
+        self.assertNotIn("KEY", message.upper())
 
     def test_rejects_environment_secret_inheritance(self):
         cert, key = _generate_cert_key(self.tmp)
@@ -320,32 +362,61 @@ remote-cert-tls server
                 host="test", ip=ip, country="JP", ping_ms=1,
                 speed_bps=1, score=1, profile=profile,
             ),
-            remote=type("RemoteKey", (), {"ip": ip, "port": port, "protocol": protocol}),
+            remote=RemoteKey(ip=ip, port=port, protocol=protocol),  # type: ignore[arg-type]
             ingress_geo=GeoDecision.TOKYO,
             catalog_rank=1,
         )
 
-    def _geo(self, decision: GeoDecision = GeoDecision.TOKYO) -> Callable[[str], GeoDecision]:
+    def _geo(self, decision: GeoDecision = GeoDecision.TOKYO):
         return lambda ip: decision
 
     def test_prerequisites_unavailable_returns_blocked(self):
         self.runner.prerequisites_ok_value = False
         result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
         self.assertEqual(result.status, ProbeStatus.BLOCKED)
+        self.assertEqual(result.reason_code, "prerequisites_unavailable")
 
     def test_rejects_vpn_orbit_username_env(self):
         with patch.dict(os.environ, {"VPN_ORBIT_USERNAME": "vpn"}):
             result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
             self.assertEqual(result.status, ProbeStatus.BLOCKED)
+            self.assertEqual(result.reason_code, "environment_secret_inheritance_rejected")
 
     def test_rejects_vpn_orbit_password_env(self):
         with patch.dict(os.environ, {"VPN_ORBIT_PASSWORD": "vpn"}):
             result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
             self.assertEqual(result.status, ProbeStatus.BLOCKED)
 
+    def test_supervisor_starts_before_setup_isolation(self):
+        probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
+        idx_supervisor = self.runner.commands.index("supervisor started")
+        idx_save = self.runner.commands.index("save ip_forward")
+        idx_setup = self.runner.commands.index("ip netns add test-ns")
+        self.assertLess(idx_supervisor, idx_save)
+        self.assertLess(idx_save, idx_setup)
+
     def test_setup_isolation_called_with_remote_parameters(self):
         probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
         self.assertEqual(self.runner.last_setup, ("8.8.8.8", "udp", 1195))
+
+    def test_ip_forward_saved_and_restored(self):
+        probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
+        self.assertTrue(self.runner.ip_forward_saved)
+        self.assertTrue(self.runner.ip_forward_restored)
+        self.assertIn("save ip_forward", self.runner.commands)
+        self.assertIn("restore ip_forward", self.runner.commands)
+
+    def test_ip_forward_save_failure_returns_blocked(self):
+        self.runner.save_ip_forward_fails = True
+        result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
+        self.assertEqual(result.status, ProbeStatus.BLOCKED)
+        self.assertEqual(result.reason_code, "ip_forward_save_failed")
+
+    def test_ip_forward_restore_failure_returns_fail(self):
+        self.runner.restore_ip_forward_fails = True
+        result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
+        self.assertEqual(result.status, ProbeStatus.FAIL)
+        self.assertIn("restore_ip_forward_failed", result.reason_code)
 
     def test_cleanup_called_on_success(self):
         probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
@@ -356,59 +427,219 @@ remote-cert-tls server
         self.runner.wait_for_tun_result = (None, "timeout")
         result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner, timeout_s=5)
         self.assertEqual(result.status, ProbeStatus.NOT_VERIFIED)
-        self.assertIn("timeout", result.reason_code.lower())
+        self.assertEqual(result.reason_code, "tun_not_established")
 
     def test_curl_failure_returns_not_verified(self):
-        self.runner.curl_result = (None, "tls handshake failed")
+        self.runner.curl_result = CurlOutcome(body=None, error="tls handshake failed")
         result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
         self.assertEqual(result.status, ProbeStatus.NOT_VERIFIED)
+        self.assertEqual(result.reason_code, "exit_ip_fetch_failed")
 
-    def test_non_tokyo_geo_returns_fail(self):
+    def test_non_tokyo_geo_returns_not_verified(self):
         self.runner.exit_ip = "1.1.1.1"
         result = probe_one(self.candidate, geo_lookup=self._geo(GeoDecision.NON_TOKYO), runner=self.runner)
-        self.assertEqual(result.status, ProbeStatus.FAIL)
+        self.assertEqual(result.status, ProbeStatus.NOT_VERIFIED)
+        self.assertEqual(result.reason_code, "exit_ip_non_tokyo")
 
     def test_unknown_geo_returns_not_verified(self):
         self.runner.exit_ip = "1.1.1.1"
         result = probe_one(self.candidate, geo_lookup=self._geo(GeoDecision.UNKNOWN), runner=self.runner)
         self.assertEqual(result.status, ProbeStatus.NOT_VERIFIED)
+        self.assertEqual(result.reason_code, "exit_ip_geoip_unavailable")
 
-    def test_unexpected_exit_ip_format_rejected(self):
+    def test_unexpected_exit_ip_format_rejected_not_verified(self):
         self.runner.exit_ip = "not-an-ip"
         result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
-        self.assertIn(result.status, (ProbeStatus.FAIL, ProbeStatus.NOT_VERIFIED))
+        self.assertEqual(result.status, ProbeStatus.NOT_VERIFIED)
+        self.assertEqual(result.reason_code, "echo_ip_not_global")
 
-    def test_route_nopull_present_in_config(self):
-        probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
-        config = self.runner.last_config
-        self.assertIn("route-nopull", config.decode())
+    def test_unauthorized_egress_returns_fail(self):
+        self.runner.curl_result = CurlOutcome(
+            body=None, error="leak", safety_violation="unauthorized_egress"
+        )
+        result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
+        self.assertEqual(result.status, ProbeStatus.FAIL)
+        self.assertEqual(result.reason_code, "unauthorized_egress")
 
-    def test_no_default_route_in_namespace(self):
+    def test_cleanup_failure_returns_fail(self):
+        self.runner.teardown_fails = True
+        result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
+        self.assertEqual(result.status, ProbeStatus.FAIL)
+        self.assertTrue(result.reason_code.startswith("cleanup_failed"))
+
+    def test_terminate_failure_recorded_in_cleanup(self):
+        self.runner.terminate_fails = True
+        result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
+        self.assertEqual(result.status, ProbeStatus.FAIL)
+        self.assertIn("terminate_failed", result.reason_code)
+
+    def test_supervisor_cleanup_unconfirmed_returns_fail(self):
+        self.runner.supervisor_cleanup_confirmed = False
+        result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
+        self.assertEqual(result.status, ProbeStatus.FAIL)
+        self.assertIn("supervisor_cleanup_failed", result.reason_code)
+
+    def test_supervisor_start_failure_returns_blocked(self):
+        self.runner.supervisor_start_fails = True
+        result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
+        self.assertEqual(result.status, ProbeStatus.BLOCKED)
+        self.assertEqual(result.reason_code, "supervisor_start_failed")
+
+    def test_host_default_route_unchanged(self):
+        result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
+        self.assertEqual(result.status, ProbeStatus.PASS)
+        self.assertIn("host default route check", self.runner.commands)
+
+    def test_pre_tunnel_echo_reachable_returns_fail(self):
+        self.runner.pre_tunnel_echo_blocked = False
+        result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
+        self.assertEqual(result.status, ProbeStatus.FAIL)
+        self.assertEqual(result.reason_code, "pre_tunnel_echo_reachable")
+
+    def test_route_not_via_tun0_returns_fail(self):
+        self.runner.route_get_via_tun0_result = False
+        result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
+        self.assertEqual(result.status, ProbeStatus.FAIL)
+        self.assertEqual(result.reason_code, "echo_route_not_tun0")
+
+    def test_malicious_raw_profile_rejected_before_openvpn(self):
+        profile = """client
+proto udp
+remote 8.8.8.8 1195
+cipher AES-128-CBC
+auth SHA1
+remote-cert-tls server
+script-security 3
+up /tmp/pwned.sh
+<ca>
+-----BEGIN CERTIFICATE-----
+MIIBkTCB+wIJAKHBfpE
+-----END CERTIFICATE-----
+</ca>
+"""
+        candidate = ScreenedCandidate(
+            candidate=Candidate(
+                host="evil", ip="8.8.8.8", country="JP", ping_ms=1,
+                speed_bps=1, score=1, profile=profile,
+            ),
+            remote=RemoteKey(ip="8.8.8.8", port=1195, protocol="udp"),  # type: ignore[arg-type]
+            ingress_geo=GeoDecision.TOKYO,
+            catalog_rank=1,
+        )
+        result = probe_one(candidate, geo_lookup=self._geo(), runner=self.runner)
+        self.assertEqual(result.status, ProbeStatus.NOT_VERIFIED)
+        self.assertEqual(result.reason_code, "profile_parse_failed")
+        self.assertFalse(self.runner.supervisor_started)
+
+    def test_openvpn_env_is_allowlisted(self):
         probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
-        self.assertNotIn("default via", self.runner.commands)
+        self.assertIsNotNone(self.runner.last_openvpn_env)
+        self.assertNotIn("IPAPI_IS_API_KEY", self.runner.last_openvpn_env)
+        self.assertIn("PATH", self.runner.last_openvpn_env)
+        self.assertEqual(self.runner.last_openvpn_cwd, self.runner._resources.private_dir)
+
+    def test_no_default_route_recorded(self):
+        probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
+        self.assertIn("default route absent", self.runner.commands)
         self.assertFalse(self.runner.has_default_route)
 
     def test_only_remote_32_via_veth(self):
         probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
         self.assertTrue(self.runner.has_remote_32_route)
+        route_commands = [c for c in self.runner.commands if c.startswith("ip route add")]
+        self.assertTrue(any("8.8.8.8/32" in c for c in route_commands))
 
     def test_echo_32_via_tun0(self):
         probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
         self.assertTrue(self.runner.has_echo_32_route)
 
-    def test_observed_unauthorized_egress_returns_fail(self):
-        self.runner.unauthorized_egress = True
-        result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
-        self.assertEqual(result.status, ProbeStatus.FAIL)
-
-    def test_cleanup_failure_returns_fail(self):
-        self.runner.cleanup_fail = True
-        result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
-        self.assertEqual(result.status, ProbeStatus.FAIL)
-
-    def test_host_default_route_untouched(self):
+    def test_curl_uses_resolve_and_interface(self):
         probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
-        self.assertFalse(self.runner.host_route_modified)
+        curl_commands = [c for c in self.runner.commands if c.startswith("curl ")]
+        self.assertEqual(len(curl_commands), 1)
+        self.assertIn("--interface tun0", curl_commands[0])
+        self.assertIn("--resolve api.ipify.org:443:1.1.1.1", curl_commands[0])
+
+    def test_tun_ip_invalid_returns_not_verified(self):
+        self.runner.wait_for_tun_result = ("not-an-ip", "ok")
+        result = probe_one(self.candidate, geo_lookup=self._geo(), runner=self.runner)
+        self.assertEqual(result.status, ProbeStatus.NOT_VERIFIED)
+        self.assertEqual(result.reason_code, "tun_ip_invalid")
+
+
+class LifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vpn-orbit-probe-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _candidate(self, ip: str = "8.8.8.8") -> ScreenedCandidate:
+        ca, _ = _generate_cert_key(self.tmp)
+        profile = f"""client
+proto udp
+remote {ip} 1195
+cipher AES-128-CBC
+auth SHA1
+remote-cert-tls server
+<ca>
+{ca}</ca>
+"""
+        return ScreenedCandidate(
+            candidate=Candidate(
+                host="test", ip=ip, country="JP", ping_ms=1,
+                speed_bps=1, score=1, profile=profile,
+            ),
+            remote=RemoteKey(ip=ip, port=1195, protocol="udp"),  # type: ignore[arg-type]
+            ingress_geo=GeoDecision.TOKYO,
+            catalog_rank=1,
+        )
+
+    def test_private_dir_removed_after_success(self):
+        runner = FakeRunner(self.tmp)
+        candidate = self._candidate()
+        probe_one(candidate, geo_lookup=lambda ip: GeoDecision.TOKYO, runner=runner)
+        self.assertFalse(runner._resources.private_dir.exists())
+
+    def test_private_dir_removed_after_timeout(self):
+        runner = FakeRunner(self.tmp)
+        runner.wait_for_tun_result = (None, "timeout")
+        candidate = self._candidate()
+        probe_one(candidate, geo_lookup=lambda ip: GeoDecision.UNKNOWN, runner=runner, timeout_s=5)
+        self.assertFalse(runner._resources.private_dir.exists())
+
+    def test_probe_candidates_isolates_exceptions(self):
+        class ExplodingRunner(FakeRunner):
+            def start_openvpn(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        ca, _ = _generate_cert_key(self.tmp)
+        profile = f"""client
+proto udp
+remote 8.8.8.8 1195
+cipher AES-128-CBC
+auth SHA1
+remote-cert-tls server
+<ca>
+{ca}</ca>
+"""
+        candidates = [
+            ScreenedCandidate(
+                candidate=Candidate(
+                    host="test", ip="8.8.8.8", country="JP", ping_ms=1,
+                    speed_bps=1, score=1, profile=profile,
+                ),
+                remote=RemoteKey(ip="8.8.8.8", port=1195, protocol="udp"),  # type: ignore[arg-type]
+                ingress_geo=GeoDecision.TOKYO,
+                catalog_rank=1,
+            ),
+        ]
+        results = probe_candidates(
+            candidates, geo_lookup=lambda ip: GeoDecision.UNKNOWN, runner=ExplodingRunner(self.tmp)
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, ProbeStatus.NOT_VERIFIED)
+        self.assertEqual(results[0].reason_code, "probe_exception")
 
 
 if __name__ == "__main__":
