@@ -6,13 +6,16 @@ status aggregation.
 """
 from __future__ import annotations
 
+import argparse
 import ipaddress
-from dataclasses import dataclass
-from typing import Callable, Iterable, Literal
+import json
+import os
+from dataclasses import asdict, dataclass
+from typing import Callable, Iterable, Literal, NoReturn
 
-from .geoip import GeoDecision
+from .geoip import GeoDecision, lookup_geoip
 from .openvpn_probe import ProbeResult, ProbeStatus, probe_candidates, probe_one
-from .phase1 import Candidate, convert_ovpn, parse_catalog
+from .phase1 import Candidate, convert_ovpn, fetch_catalog, parse_catalog
 
 
 __all__ = [
@@ -177,3 +180,62 @@ def screen_candidates(
 
 
 # probe_candidates is re-exported from openvpn_probe.
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeSummary:
+    status: str
+    tested_count: int = 0
+    tokyo_confirmed_count: int = 0
+    witness_ingress: str | None = None
+    witness_exit: str | None = None
+    reason_codes: tuple[str, ...] = ()
+
+
+class _SummaryParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        # argparse normally echoes untrusted argument values to stderr.
+        raise ValueError("invalid_arguments")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the bounded feasibility check, emitting one redacted JSON object only."""
+    parser = _SummaryParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--scan-window", type=int, default=40, choices=range(1, 1001))
+    parser.add_argument("--limit", type=int, default=10, choices=range(1, 11))
+    parser.add_argument("--timeout-seconds", type=int, default=60, choices=range(1, 61))
+    try:
+        args = parser.parse_args(argv)
+    except ValueError:
+        summary = ProbeSummary("BLOCKED", reason_codes=("invalid_arguments",))
+    else:
+        if any(name in os.environ for name in ("VPN_ORBIT_USERNAME", "VPN_ORBIT_PASSWORD")):
+            summary = ProbeSummary("BLOCKED", reason_codes=("environment_secret_inheritance_rejected",))
+        else:
+            try:
+                api_key = os.environ.get("IPAPI_IS_API_KEY", "")
+
+                def geo_lookup(ip: str) -> GeoDecision:
+                    return lookup_geoip(ip, api_key=api_key)
+
+                candidates = screen_candidates(fetch_catalog(), existing_pins=frozenset(),
+                    geo_lookup=geo_lookup, scan_window=args.scan_window, limit=args.limit)
+                results = probe_candidates(candidates, geo_lookup=geo_lookup,
+                                           timeout_s=args.timeout_seconds)
+                status = aggregate_status(result.status for result in results)
+                confirmed = [result for result in results if result.status == ProbeStatus.PASS]
+                witness = next(iter(confirmed), None) if status == ProbeStatus.PASS else None
+                summary = ProbeSummary(status.value, len(results), len(confirmed),
+                    f"{witness.ingress_ip}:{witness.port}/{witness.protocol}" if witness else None,
+                    witness.exit_ip if witness else None,
+                    tuple(sorted({result.reason_code for result in results})))
+            except (OSError, UnicodeError, ValueError):
+                summary = ProbeSummary("NOT_VERIFIED", reason_codes=("input_unavailable",))
+            except Exception:  # noqa: BLE001 -- CLI boundary must never expose profiles or secrets
+                summary = ProbeSummary("FAIL", reason_codes=("execution_failed",))
+    print(json.dumps(asdict(summary), separators=(",", ":")))
+    return int(summary.status != ProbeStatus.PASS.value)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -4,10 +4,19 @@ from __future__ import annotations
 import base64
 import csv
 import io
+import json
+import os
+import re
 import shutil
+import subprocess
+import sys
 import tempfile
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 import unittest
+from unittest.mock import patch
+
+from vpn_orbit import cloud_probe
 
 from vpn_orbit.cloud_probe import (
     GeoDecision,
@@ -338,6 +347,136 @@ remote-cert-tls server
             exit_ip="1.1.1.1", status=ProbeStatus.PASS, reason_code="ok",
         )
         self.assertIsInstance(result.status, ProbeStatus)
+
+
+class CloudProbeCliTests(unittest.TestCase):
+    args = ["--scan-window", "40", "--limit", "10", "--timeout-seconds", "60"]
+
+    def invoke(self, results=(), *, error=None, args=None, env=None):
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, env or {}, clear=True), \
+                patch.object(cloud_probe, "fetch_catalog", return_value="catalog"), \
+                patch.object(cloud_probe, "screen_candidates", return_value=[]) as screen, \
+                patch.object(cloud_probe, "probe_candidates", return_value=list(results), side_effect=error) as probe, \
+                redirect_stdout(output), redirect_stderr(errors):
+            code = cloud_probe.main(self.args if args is None else args)
+            if probe.called:
+                self.assertEqual(probe.call_args.kwargs["timeout_s"], 60)
+        self.assertEqual(errors.getvalue(), "")
+        return code, json.loads(output.getvalue()), screen
+
+    def test_summary_allowlist_and_status_contract(self):
+        for status in ProbeStatus:
+            with self.subTest(status=status):
+                result = ProbeResult("8.8.8.8", 1195, "udp", "1.1.1.1", status, "ok",
+                                     ("RAW_OVPN_SECRET",))
+                code, summary, _ = self.invoke([result])
+                self.assertEqual(set(summary), {"status", "tested_count", "tokyo_confirmed_count",
+                                               "witness_ingress", "witness_exit", "reason_codes"})
+                self.assertEqual(summary["status"], status.value)
+                self.assertEqual(summary["tested_count"], 1)
+                self.assertEqual(summary["tokyo_confirmed_count"], int(status == ProbeStatus.PASS))
+                self.assertEqual(code, int(status != ProbeStatus.PASS))
+                self.assertNotIn("RAW_OVPN_SECRET", json.dumps(summary))
+                if status == ProbeStatus.PASS:
+                    self.assertEqual(summary["witness_ingress"], "8.8.8.8:1195/udp")
+                    self.assertEqual(summary["witness_exit"], "1.1.1.1")
+                else:
+                    self.assertIsNone(summary["witness_ingress"])
+                    self.assertIsNone(summary["witness_exit"])
+
+    def test_empty_shortlist_is_not_verified(self):
+        code, summary, _ = self.invoke()
+        self.assertEqual((code, summary["status"], summary["tested_count"]), (1, "NOT_VERIFIED", 0))
+
+    def test_cli_forwards_exact_bounds_and_key_to_geoip_only(self):
+        with patch.object(cloud_probe, "lookup_geoip", return_value=GeoDecision.TOKYO) as lookup:
+            _, _, screen = self.invoke(env={"IPAPI_IS_API_KEY": "test-secret"})
+            self.assertEqual(screen.call_args.kwargs["scan_window"], 40)
+            self.assertEqual(screen.call_args.kwargs["limit"], 10)
+            screen.call_args.kwargs["geo_lookup"]("8.8.8.8")
+            lookup.assert_called_once_with("8.8.8.8", api_key="test-secret")
+
+    def test_rejects_personal_credentials_before_network(self):
+        for name in ("VPN_ORBIT_USERNAME", "VPN_ORBIT_PASSWORD"):
+            with self.subTest(name=name):
+                code, summary, screen = self.invoke(env={name: ""})
+                self.assertEqual((code, summary["status"]), (1, "BLOCKED"))
+                self.assertEqual(summary["reason_codes"], ["environment_secret_inheritance_rejected"])
+                screen.assert_not_called()
+
+    def test_invalid_arguments_emit_redacted_json(self):
+        for args in (["--limit", "11"], ["--scan-window", "0"], ["--timeout-seconds", "61"],
+                     ["--timeout-seconds", "0"], ["--scan-window", "1001"], ["--limit", "secret"]):
+            with self.subTest(args=args):
+                code, summary, screen = self.invoke(args=args)
+                self.assertEqual((code, summary["status"], summary["reason_codes"]),
+                                 (1, "BLOCKED", ["invalid_arguments"]))
+                screen.assert_not_called()
+
+    def test_exception_text_is_not_emitted(self):
+        code, summary, _ = self.invoke(error=RuntimeError("RAW_OVPN_SECRET"))
+        self.assertEqual((code, summary["status"], summary["reason_codes"]),
+                         (1, "FAIL", ["execution_failed"]))
+        self.assertNotIn("RAW_OVPN_SECRET", json.dumps(summary))
+
+    def test_fail_overrides_pass_without_witness(self):
+        results = [ProbeResult("8.8.8.8", 1195, "udp", "1.1.1.1", ProbeStatus.PASS, "ok"),
+                   ProbeResult("9.9.9.9", 1195, "udp", None, ProbeStatus.FAIL, "cleanup_failed")]
+        code, summary, _ = self.invoke(results)
+        self.assertEqual((code, summary["status"], summary["witness_exit"]), (1, "FAIL", None))
+
+    def test_module_entrypoint_rejects_credentials_offline(self):
+        result = subprocess.run([sys.executable, "-m", "vpn_orbit.cloud_probe", *self.args],
+                                env={**os.environ, "VPN_ORBIT_USERNAME": "do-not-log"},
+                                capture_output=True, text=True, timeout=5, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(json.loads(result.stdout)["status"], "BLOCKED")
+        self.assertNotIn("do-not-log", result.stdout)
+
+    def test_cli_pipeline_keeps_geoip_secret_out_of_openvpn_environment(self):
+        catalog = _catalog([("8.8.8.8", "JP", 1, _profile())])
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            runner = FakeRunner(Path(directory))
+            with patch.dict(os.environ, {"IPAPI_IS_API_KEY": "test-secret"}, clear=True), \
+                    patch.object(cloud_probe, "fetch_catalog", return_value=catalog), \
+                    patch.object(cloud_probe, "lookup_geoip", return_value=GeoDecision.TOKYO), \
+                    patch("vpn_orbit.openvpn_probe.SubprocessRunner", return_value=runner), \
+                    redirect_stdout(output):
+                code = cloud_probe.main(self.args)
+            self.assertEqual(code, 0)
+            self.assertEqual(runner.last_openvpn_env,
+                             {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"})
+            self.assertTrue(runner.cleaned)
+        self.assertEqual(json.loads(output.getvalue())["tokyo_confirmed_count"], 1)
+        self.assertNotIn("test-secret", output.getvalue())
+
+
+class ProbeWorkflowTests(unittest.TestCase):
+    def test_manual_only_bounded_workflow(self):
+        workflow = Path(__file__).resolve().parents[1] / ".github/workflows/probe-tokyo-vpn.yml"
+        self.assertTrue(workflow.exists(), "manual probe workflow is missing")
+        text = workflow.read_text()
+        top_level = re.findall(r"^(\w[\w-]*):", text, re.MULTILINE)
+        self.assertIn("on", top_level)
+        triggers = text.split("on:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(triggers.strip(), "workflow_dispatch:")
+        self.assertIn("runs-on: ubuntu-24.04", text)
+        self.assertIn("permissions:\n  contents: read", text)
+        timeout = re.search(r"timeout-minutes: (\d+)", text)
+        assert timeout is not None
+        self.assertLessEqual(int(timeout[1]), 20)
+        self.assertIn("group: vpn-orbit-tokyo-probe", text)
+        self.assertIn("cancel-in-progress: false", text)
+        self.assertIn("--scan-window 40 --limit 10 --timeout-seconds 60", text)
+        self.assertIn("IPAPI_IS_API_KEY: ${{ secrets.IPAPI_IS_API_KEY }}", text)
+        self.assertIn("sudo --preserve-env=IPAPI_IS_API_KEY -- python3 -m vpn_orbit.cloud_probe", text)
+        self.assertIn("persist-credentials: false", text)
+        for forbidden in ("push:", "pull_request:", "schedule:", "CLOUDFLARE", "wrangler",
+                          "upload-artifact", "run: curl", "sudo -E", "--preserve-env "):
+            self.assertNotIn(forbidden, text)
 
 
 if __name__ == "__main__":
