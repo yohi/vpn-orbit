@@ -13,12 +13,25 @@ from .probe_commands import Commands
 
 def validate_pem(certificate: str, *, commands: Commands | None = None) -> None:
     pem = certificate.strip()
-    if not re.fullmatch(r"-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\s]+\s+-----END CERTIFICATE-----", pem):
+    pattern = re.compile(
+        r"-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\s]+\s+-----END CERTIFICATE-----"
+    )
+    certificates = list(pattern.finditer(pem))
+    gaps = [
+        pem[start:end]
+        for start, end in zip(
+            [0, *(match.end() for match in certificates)],
+            [*(match.start() for match in certificates), len(pem)],
+        )
+    ]
+    if not certificates or any(gap.strip() for gap in gaps):
         raise UnsupportedProfile("ambiguous CA PEM")
     try:
-        ssl.PEM_cert_to_DER_cert(pem)
         owner = commands or Commands(time.monotonic() + 2)
-        owner.openssl(["x509", "-noout"], pem.encode(), 2)
+        for match in certificates:
+            certificate_pem = match.group()
+            ssl.PEM_cert_to_DER_cert(certificate_pem)
+            owner.openssl(["x509", "-noout"], certificate_pem.encode(), 2)
     except (ValueError, OSError, TimeoutError, subprocess.SubprocessError) as exc:
         raise UnsupportedProfile("invalid CA certificate") from exc
 

@@ -46,6 +46,21 @@ class CryptoOwnershipTests(unittest.TestCase):
         self.assertEqual(len(owner.calls), 1)
         self.assertEqual(owner.calls[0][:2], (["x509", "-noout"], ca.strip().encode()))
 
+    def test_ca_bundle_validates_each_certificate(self):
+        ca = (Path(__file__).parent / "fixtures" / "test-ca.pem").read_text().strip()
+        class RecordingOwner(Commands):
+            def __init__(self) -> None:
+                super().__init__(time.monotonic() + 5)
+                self.inputs: list[bytes] = []
+
+            def openssl(self, args: Sequence[str], data: bytes, timeout_s: float) -> bytes:
+                self.inputs.append(data)
+                return b"valid"
+
+        owner = RecordingOwner()
+        validate_pem(ca + "\n\n" + ca, commands=owner)
+        self.assertEqual(owner.inputs, [ca.encode(), ca.encode()])
+
     def test_spki_steps_share_supplied_owner(self):
         # Given distinct certificate and private-key input values.
         owner = CryptoRecorder()

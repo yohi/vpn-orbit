@@ -76,7 +76,7 @@ class Round3Tests(unittest.TestCase):
                     "data_ciphers_fallback": "AES-128-CBC"}
                 match mutation:
                     case "ca_der": tls["certificate"] = ["-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----"]
-                    case "ca_extra": tls["certificate"] = [ca + ca]
+                    case "ca_extra": tls["certificate"] = [ca + "\nnot-a-certificate"]
                     case "cipher_type": endpoint["data_ciphers"] = [123]
                     case "port_bool": endpoint["server_port"] = True
                     case "server": endpoint["server"] = "1.1.1.1"

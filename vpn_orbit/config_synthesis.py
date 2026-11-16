@@ -202,7 +202,7 @@ def synthesize_openvpn_config(
     wrap_path, wrap_direction, wrap_type, key_material = _validate_control_wrap(tls.get("control_wrap"))
     username, password, data_ciphers, fallback, auth = _validated_crypto_options(parsed_endpoint)
 
-    # Write files under private_dir.
+    private_dir = private_dir.resolve()
     ca_path = private_dir / "ca.pem"
     _write_private_file(ca_path, b"\n".join(validated_ca_certs) + b"\n")
     cert_path = private_dir / "cert.pem"

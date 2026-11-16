@@ -39,6 +39,24 @@ class ConfigSynthesisTests(unittest.TestCase):
         self.assertIn("ca ", config.decode())
         self.assertIn("ca.pem", config.decode())
 
+    def test_relative_private_dir_generates_absolute_ca_reference(self):
+        ca, _ = _generate_cert_key(self.tmp)
+        private = self.tmp / "relative-private"
+        private.mkdir(mode=0o700)
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(self.tmp)
+            config = synthesize_openvpn_config(
+                _endpoint(ca=ca), remote_ip="8.8.8.8", port=1195,
+                protocol="udp", private_dir=Path("relative-private"),
+            )
+        finally:
+            os.chdir(previous_cwd)
+        ca_directive = next(line for line in config.decode().splitlines() if line.startswith("ca "))
+        ca_reference = Path(shlex.split(ca_directive)[1])
+        self.assertTrue(ca_reference.is_absolute())
+        self.assertEqual(ca_reference, private / "ca.pem")
+
     def test_cert_and_key_files_written(self):
         cert, key = _generate_cert_key(self.tmp)
         config = self._synthesize(_endpoint(cert=cert, key=key))

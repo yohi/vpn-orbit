@@ -208,5 +208,10 @@ def probe_one(candidate: ScreenedCandidate, *, geo_lookup: Callable[[str], GeoDe
 def probe_candidates(candidates: list[ScreenedCandidate], *,
                      geo_lookup: Callable[[str], GeoDecision], timeout_s: int = 60,
                      runner: ProbeRunner | None = None) -> list[ProbeResult]:
-    return [probe_one(c, geo_lookup=geo_lookup, timeout_s=timeout_s, runner=runner)
-            for c in candidates[:10]]
+    results: list[ProbeResult] = []
+    for candidate in candidates[:10]:
+        result = probe_one(candidate, geo_lookup=geo_lookup, timeout_s=timeout_s, runner=runner)
+        results.append(result)
+        if result.reason_code.startswith("cleanup_failed"):
+            break
+    return results

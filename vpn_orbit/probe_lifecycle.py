@@ -24,15 +24,20 @@ def bounded(deadline: float) -> Iterator[None]:
     # SIGALRM bounds even a stalled DNS resolver, injected callback, or setup.
     if threading.current_thread() is not threading.main_thread():
         raise RuntimeError("probe requires the main thread")
+    now = time.monotonic()
     previous = signal.signal(signal.SIGALRM, _expired)
-    timer = signal.setitimer(signal.ITIMER_REAL, max(0.001, deadline - time.monotonic()))
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    previous_deadline = now + previous_timer[0] if previous_timer[0] > 0 else None
+    effective_deadline = min(deadline, previous_deadline) if previous_deadline is not None else deadline
+    signal.setitimer(signal.ITIMER_REAL, max(0.001, effective_deadline - now))
     try:
         yield
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
-        if timer[0] > 0:
-            signal.setitimer(signal.ITIMER_REAL, *timer)
+        if previous_deadline is not None:
+            remaining = max(0.001, previous_deadline - time.monotonic())
+            signal.setitimer(signal.ITIMER_REAL, remaining, previous_timer[1])
 
 
 def cleanup(runner: ProbeRunner, resources: IsolationResources | None,
