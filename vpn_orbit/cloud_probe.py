@@ -198,6 +198,45 @@ class _SummaryParser(argparse.ArgumentParser):
         raise ValueError("invalid_arguments")
 
 
+def _summarize_results(results: list[ProbeResult]) -> ProbeSummary:
+    status = aggregate_status(result.status for result in results)
+    confirmed = [result for result in results if result.status == ProbeStatus.PASS]
+    witness = next(iter(confirmed), None) if status == ProbeStatus.PASS else None
+    return ProbeSummary(
+        status.value,
+        len(results),
+        len(confirmed),
+        f"{witness.ingress_ip}:{witness.port}/{witness.protocol}" if witness else None,
+        witness.exit_ip if witness else None,
+        tuple(sorted({result.reason_code for result in results})),
+    )
+
+
+def _run_pipeline(args: argparse.Namespace) -> ProbeSummary:
+    if any(name in os.environ for name in ("VPN_ORBIT_USERNAME", "VPN_ORBIT_PASSWORD")):
+        return ProbeSummary("BLOCKED", reason_codes=("environment_secret_inheritance_rejected",))
+    if not os.environ.get("IPAPI_IS_API_KEY", "").strip():
+        return ProbeSummary("BLOCKED", reason_codes=("geoip_api_key_missing",))
+    try:
+        api_key = os.environ["IPAPI_IS_API_KEY"]
+
+        def geo_lookup(ip: str) -> GeoDecision:
+            return lookup_geoip(ip, api_key=api_key)
+
+        candidates = screen_candidates(
+            fetch_catalog(), existing_pins=frozenset(), geo_lookup=geo_lookup,
+            scan_window=args.scan_window, limit=args.limit,
+        )
+        results = probe_candidates(
+            candidates, geo_lookup=geo_lookup, timeout_s=args.timeout_seconds,
+        )
+        return _summarize_results(results)
+    except (OSError, UnicodeError, ValueError):
+        return ProbeSummary("NOT_VERIFIED", reason_codes=("input_unavailable",))
+    except Exception:  # noqa: BLE001 -- CLI boundary must never expose profiles or secrets
+        return ProbeSummary("FAIL", reason_codes=("execution_failed",))
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the bounded feasibility check, emitting one redacted JSON object only."""
     parser = _SummaryParser(add_help=False, allow_abbrev=False)
@@ -209,32 +248,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError:
         summary = ProbeSummary("BLOCKED", reason_codes=("invalid_arguments",))
     else:
-        if any(name in os.environ for name in ("VPN_ORBIT_USERNAME", "VPN_ORBIT_PASSWORD")):
-            summary = ProbeSummary("BLOCKED", reason_codes=("environment_secret_inheritance_rejected",))
-        elif not os.environ.get("IPAPI_IS_API_KEY", "").strip():
-            summary = ProbeSummary("BLOCKED", reason_codes=("geoip_api_key_missing",))
-        else:
-            try:
-                api_key = os.environ.get("IPAPI_IS_API_KEY", "")
-
-                def geo_lookup(ip: str) -> GeoDecision:
-                    return lookup_geoip(ip, api_key=api_key)
-
-                candidates = screen_candidates(fetch_catalog(), existing_pins=frozenset(),
-                    geo_lookup=geo_lookup, scan_window=args.scan_window, limit=args.limit)
-                results = probe_candidates(candidates, geo_lookup=geo_lookup,
-                                           timeout_s=args.timeout_seconds)
-                status = aggregate_status(result.status for result in results)
-                confirmed = [result for result in results if result.status == ProbeStatus.PASS]
-                witness = next(iter(confirmed), None) if status == ProbeStatus.PASS else None
-                summary = ProbeSummary(status.value, len(results), len(confirmed),
-                    f"{witness.ingress_ip}:{witness.port}/{witness.protocol}" if witness else None,
-                    witness.exit_ip if witness else None,
-                    tuple(sorted({result.reason_code for result in results})))
-            except (OSError, UnicodeError, ValueError):
-                summary = ProbeSummary("NOT_VERIFIED", reason_codes=("input_unavailable",))
-            except Exception:  # noqa: BLE001 -- CLI boundary must never expose profiles or secrets
-                summary = ProbeSummary("FAIL", reason_codes=("execution_failed",))
+        summary = _run_pipeline(args)
     print(json.dumps(asdict(summary), separators=(",", ":")))
     return int(summary.status != ProbeStatus.PASS.value)
 

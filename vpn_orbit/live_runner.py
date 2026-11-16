@@ -13,6 +13,10 @@ from .runner_types import CurlOutcome, IsolationResources, ProcessHandle
 from .supervisor_client import SupervisedProcess, SupervisorClient
 
 
+_ECHO_URL = "https://api.ipify.org/"
+_HTTPS_ONLY = "=https"
+
+
 class SubprocessRunner:
     def __init__(self) -> None:
         self.commands: Commands = Commands(time.monotonic() + 5)
@@ -80,7 +84,7 @@ class SubprocessRunner:
         resources.echo_ip = echo_ip
         result = self.commands.run(ns_command(resources, "curl", "-4", "--silent", "--noproxy", "*",
             "--connect-timeout", "1", "--max-time", "2", "--resolve", f"api.ipify.org:443:{echo_ip}",
-            "--proto", "=https", "https://api.ipify.org/"))
+            "--proto", _HTTPS_ONLY, _ECHO_URL))
         return result.returncode in (7, 28), f"curl_exit_{result.returncode}"
 
     def route_get_via_tun0(self, echo_ip: str, resources: IsolationResources,
@@ -106,17 +110,17 @@ class SubprocessRunner:
         result = self.commands.run(ns_command(resources, "ip", "-4", "route", "get", echo_ip,
                                              "oif", resources.veth_ns))
         curl = self.commands.run(ns_command(resources, "curl", "-4", "--silent", "--interface", resources.veth_ns,
-            "--resolve", f"api.ipify.org:443:{echo_ip}", "--noproxy", "*", "--proto", "=https",
-            "--connect-timeout", "1", "--max-time", "2", "https://api.ipify.org/"))
+            "--resolve", f"api.ipify.org:443:{echo_ip}", "--noproxy", "*", "--proto", _HTTPS_ONLY,
+            "--connect-timeout", "1", "--max-time", "2", _ECHO_URL))
         return result.returncode != 0 and curl.returncode in (7, 28), f"route_exit_{result.returncode};curl_exit_{curl.returncode}"
 
     def curl_via_tun(self, url: str, resolve: tuple[str, int, str], interface: str,
                      resources: IsolationResources, deadline: float) -> CurlOutcome:
-        if url != "https://api.ipify.org/" or interface != "tun0" or resolve != ("api.ipify.org", 443, resources.echo_ip):
+        if url != _ECHO_URL or interface != "tun0" or resolve != ("api.ipify.org", 443, resources.echo_ip):
             return CurlOutcome(None, "invalid_echo_request", "unauthorized_egress")
         result = self.commands.run(ns_command(resources, "curl", "-4", "--silent", "--fail",
             "--interface", interface, "--resolve", f"{resolve[0]}:{resolve[1]}:{resolve[2]}",
-            "--noproxy", "*", "--proto", "=https", "--connect-timeout", "2", "--max-time", "4",
+            "--noproxy", "*", "--proto", _HTTPS_ONLY, "--connect-timeout", "2", "--max-time", "4",
             "--max-filesize", "64", "--write-out", "\n%{http_code}", url))
         body, _, code = result.stdout.rpartition("\n")
         if result.returncode or code != "200" or len(body.encode()) > 64:

@@ -64,7 +64,7 @@ def cleanup(runner: ProbeRunner, resources: IsolationResources | None,
             with bounded(deadline):
                 shutil.rmtree(private_dir, ignore_errors=False)
         except FileNotFoundError:
-            return failures
+            pass
         except OSError as exc:
             failures.append("file_cleanup_error:" + type(exc).__name__)
     return failures

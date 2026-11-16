@@ -25,15 +25,22 @@ def _candidate() -> ScreenedCandidate:
 class Round3Tests(unittest.TestCase):
     def test_exception_is_redacted_and_cleanup_runs(self):
         for stage in ("setup_isolation", "wait_for_tun"):
-            for failure in (RuntimeError("secret sentinel"), KeyboardInterrupt()):
-                with self.subTest(stage=stage, error=type(failure).__name__), tempfile.TemporaryDirectory() as directory:
-                    runner = FakeRunner(Path(directory))
-                    with patch.object(runner, stage, side_effect=failure):
-                        result = probe_one(_candidate(), geo_lookup=lambda _: GeoDecision.TOKYO, runner=runner)
-                    self.assertEqual(result.status, ProbeStatus.NOT_VERIFIED)
-                    self.assertIn(type(failure).__name__, result.reason_code)
-                    self.assertNotIn("secret sentinel", result.reason_code)
-                    self.assertTrue(runner.cleaned)
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                runner = FakeRunner(Path(directory))
+                with patch.object(runner, stage, side_effect=RuntimeError("secret sentinel")):
+                    result = probe_one(_candidate(), geo_lookup=lambda _: GeoDecision.TOKYO, runner=runner)
+                self.assertEqual(result.status, ProbeStatus.NOT_VERIFIED)
+                self.assertIn("RuntimeError", result.reason_code)
+                self.assertNotIn("secret sentinel", result.reason_code)
+                self.assertTrue(runner.cleaned)
+
+    def test_keyboard_interrupt_propagates_after_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = FakeRunner(Path(directory))
+            with patch.object(runner, "setup_isolation", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    probe_one(_candidate(), geo_lookup=lambda _: GeoDecision.TOKYO, runner=runner)
+            self.assertTrue(runner.cleaned)
 
     def test_pre_tunnel_evidence_precedes_openvpn(self):
         with tempfile.TemporaryDirectory() as directory:

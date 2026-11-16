@@ -95,6 +95,17 @@ def _present_resources(r: IsolationResources, commands: Commands) -> frozenset[s
     return frozenset(present)
 
 
+def _restore_ip_forward(value: str) -> bool:
+    path = Path("/proc/sys/net/ipv4/ip_forward")
+    if value == "0":
+        path.write_text("0")
+    elif value == "1":
+        path.write_text("1")
+    else:
+        return False
+    return True
+
+
 def remove_resources(r: IsolationResources, commands: Commands) -> bool:
     """Only successful, parsed enumeration can confirm cleanup; command failure is never absence."""
     ok = True
@@ -115,7 +126,8 @@ def remove_resources(r: IsolationResources, commands: Commands) -> bool:
             ok = False
     if r.host_ip_forward_original is not None:
         try:
-            Path("/proc/sys/net/ipv4/ip_forward").write_text(r.host_ip_forward_original)
+            if not _restore_ip_forward(r.host_ip_forward_original):
+                ok = False
         except OSError:
             ok = False
     try:

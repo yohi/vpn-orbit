@@ -40,6 +40,109 @@ def _write_private_file(path: Path, data: bytes) -> None:
         file.write(data)
 
 
+def _validated_identity(
+    tls: dict[str, Any], commands: Commands | None,
+) -> tuple[list[bytes], bytes | None, bytes | None]:
+    ca_certs = tls.get("certificate")
+    if not isinstance(ca_certs, list) or not ca_certs:
+        raise UnsupportedProfile("CA certificate missing")
+    validated_ca: list[bytes] = []
+    for item in ca_certs:
+        if not isinstance(item, str):
+            raise UnsupportedProfile("CA certificate must be a string")
+        _validate_pem(item, commands=commands)
+        validated_ca.append(item.encode())
+
+    client_cert = tls.get("client_certificate")
+    client_key = tls.get("client_key")
+    if (client_cert is None) != (client_key is None):
+        raise UnsupportedProfile("client certificate and key must be paired")
+    if client_cert is None:
+        return validated_ca, None, None
+    if (not isinstance(client_cert, list) or not client_cert
+            or not isinstance(client_cert[0], str)):
+        raise UnsupportedProfile("client certificate missing")
+    if (not isinstance(client_key, list) or not client_key
+            or not isinstance(client_key[0], str)):
+        raise UnsupportedProfile("client key missing")
+    cert_pem, key_pem = client_cert[0].encode(), client_key[0].encode()
+    matched, reason = _spki_match(cert_pem, key_pem, commands=commands)
+    if not matched:
+        raise UnsupportedProfile(f"client identity SPKI mismatch: {reason}")
+    return validated_ca, cert_pem, key_pem
+
+
+def _validate_server_identity(tls: dict[str, Any]) -> tuple[str | None, str | None, str | None, str]:
+    remote_cert_tls = tls.get("remote_certificate_tls")
+    remote_cert_eku = tls.get("remote_certificate_eku")
+    if remote_cert_eku and remote_cert_tls:
+        raise UnsupportedProfile("remote-cert-tls and remote-cert-eku are mutually exclusive")
+    if remote_cert_tls is not None and remote_cert_tls != "server":
+        raise UnsupportedProfile("remote-cert-tls must be server")
+    if remote_cert_tls is None and remote_cert_eku is None:
+        raise UnsupportedProfile("server identity verification required")
+    if remote_cert_eku is not None and remote_cert_eku not in (
+        "TLS Web Server Authentication", "1.3.6.1.5.5.7.3.1",
+    ):
+        raise UnsupportedProfile("unsupported server EKU")
+
+    server_name = tls.get("server_name")
+    server_name_type = tls.get("server_name_type", "name")
+    if server_name is not None and server_name_type not in ("name", "subject", "name-prefix"):
+        raise UnsupportedProfile("unsupported verify-x509-name type")
+    if server_name is not None:
+        _quote_word(server_name)
+    return remote_cert_tls, remote_cert_eku, server_name, server_name_type
+
+
+def _validate_control_wrap(
+    wrap: Any,
+) -> tuple[str | None, str | None, str | None, str]:
+    if wrap is None:
+        return None, None, None, ""
+    if not isinstance(wrap, dict):
+        raise UnsupportedProfile("control_wrap must be a dict")
+    unknown = set(wrap) - _ALLOWED_WRAP_KEYS
+    if unknown:
+        raise UnsupportedProfile(f"unknown control_wrap keys: {sorted(unknown)}")
+    wrap_type, key_material = wrap.get("type"), wrap.get("key")
+    if not isinstance(key_material, str) or not key_material:
+        raise UnsupportedProfile("control_wrap key missing")
+    if wrap_type == "tls_auth":
+        direction = wrap.get("direction")
+        if direction not in (None, "client", "server"):
+            raise UnsupportedProfile(f"unknown tls-auth direction: {direction}")
+        wrap_direction = "1" if direction == "client" else "0" if direction == "server" else None
+        return "tls-auth.key", wrap_direction, wrap_type, key_material
+    if wrap_type == "tls_crypt":
+        if wrap.get("direction") is not None:
+            raise UnsupportedProfile("tls-crypt must not have a direction")
+        return "tls-crypt.key", None, wrap_type, key_material
+    raise UnsupportedProfile(f"unsupported control_wrap type: {wrap_type}")
+
+
+def _validated_crypto_options(
+    endpoint: dict[str, Any],
+) -> tuple[str | None, str | None, list[str], str, str]:
+    username, password = endpoint.get("username"), endpoint.get("password")
+    if (username is None) != (password is None):
+        raise UnsupportedProfile("username and password must be paired")
+    if username is not None and (username, password) != ("vpn", "vpn"):
+        raise UnsupportedProfile("only public default credentials supported")
+    data_ciphers = endpoint.get("data_ciphers", [])
+    if not isinstance(data_ciphers, list) or not data_ciphers:
+        raise UnsupportedProfile("data_ciphers missing")
+    if any(not isinstance(cipher, str) or cipher not in CIPHERS for cipher in data_ciphers):
+        raise UnsupportedProfile("unsupported data-ciphers")
+    fallback = endpoint.get("data_ciphers_fallback")
+    if not isinstance(fallback, str) or fallback not in CIPHERS:
+        raise UnsupportedProfile("unsupported data-ciphers-fallback")
+    auth = endpoint.get("auth")
+    if not isinstance(auth, str) or auth not in AUTHS:
+        raise UnsupportedProfile("unsupported auth")
+    return username, password, data_ciphers, fallback, auth
+
+
 def synthesize_openvpn_config(
     parsed_endpoint: dict[str, Any],
     *,
@@ -94,103 +197,10 @@ def synthesize_openvpn_config(
     if unknown_tls:
         raise UnsupportedProfile(f"unknown tls keys: {sorted(unknown_tls)}")
 
-    ca_certs = tls.get("certificate")
-    if not isinstance(ca_certs, list) or not ca_certs:
-        raise UnsupportedProfile("CA certificate missing")
-    validated_ca_certs: list[bytes] = []
-    for item in ca_certs:
-        if not isinstance(item, str):
-            raise UnsupportedProfile("CA certificate must be a string")
-        _validate_pem(item, commands=commands)
-        validated_ca_certs.append(item.encode())
-
-    cert_pem: bytes | None = None
-    key_pem: bytes | None = None
-    client_cert = tls.get("client_certificate")
-    client_key = tls.get("client_key")
-    if (client_cert is None) != (client_key is None):
-        raise UnsupportedProfile("client certificate and key must be paired")
-    if client_cert is not None:
-        if not isinstance(client_cert, list) or not client_cert or not isinstance(client_cert[0], str):
-            raise UnsupportedProfile("client certificate missing")
-        if not isinstance(client_key, list) or not client_key or not isinstance(client_key[0], str):
-            raise UnsupportedProfile("client key missing")
-        cert_pem = client_cert[0].encode()
-        key_pem = client_key[0].encode()
-        matched, reason = _spki_match(cert_pem, key_pem, commands=commands)
-        if not matched:
-            raise UnsupportedProfile(f"client identity SPKI mismatch: {reason}")
-
-    remote_cert_tls = tls.get("remote_certificate_tls")
-    remote_cert_eku = tls.get("remote_certificate_eku")
-    if remote_cert_eku and remote_cert_tls:
-        raise UnsupportedProfile("remote-cert-tls and remote-cert-eku are mutually exclusive")
-    if remote_cert_tls is not None and remote_cert_tls != "server":
-        raise UnsupportedProfile("remote-cert-tls must be server")
-    if remote_cert_tls is None and remote_cert_eku is None:
-        raise UnsupportedProfile("server identity verification required")
-    if remote_cert_eku is not None and remote_cert_eku not in ("TLS Web Server Authentication", "1.3.6.1.5.5.7.3.1"):
-        raise UnsupportedProfile("unsupported server EKU")
-
-    server_name = tls.get("server_name")
-    server_name_type = tls.get("server_name_type", "name")
-    if server_name is not None and server_name_type not in ("name", "subject", "name-prefix"):
-        raise UnsupportedProfile("unsupported verify-x509-name type")
-    if server_name is not None:
-        _quote_word(server_name)
-
-    wrap = tls.get("control_wrap")
-    wrap_path: str | None = None
-    wrap_direction: str | None = None
-    wrap_type: str | None = None
-    key_material = ""
-    if wrap is not None:
-        if not isinstance(wrap, dict):
-            raise UnsupportedProfile("control_wrap must be a dict")
-        unknown_wrap = set(wrap) - _ALLOWED_WRAP_KEYS
-        if unknown_wrap:
-            raise UnsupportedProfile(f"unknown control_wrap keys: {sorted(unknown_wrap)}")
-        wrap_type = wrap.get("type")
-        key_material = wrap.get("key")
-        if not isinstance(key_material, str) or not key_material:
-            raise UnsupportedProfile("control_wrap key missing")
-        if wrap_type == "tls_auth":
-            wrap_path = "tls-auth.key"
-            direction = wrap.get("direction")
-            if direction is not None:
-                if direction == "client":
-                    wrap_direction = "1"
-                elif direction == "server":
-                    wrap_direction = "0"
-                else:
-                    raise UnsupportedProfile(f"unknown tls-auth direction: {direction}")
-        elif wrap_type == "tls_crypt":
-            if wrap.get("direction") is not None:
-                raise UnsupportedProfile("tls-crypt must not have a direction")
-            wrap_path = "tls-crypt.key"
-        else:
-            raise UnsupportedProfile(f"unsupported control_wrap type: {wrap_type}")
-
-    username = parsed_endpoint.get("username")
-    password = parsed_endpoint.get("password")
-    if (username is None) != (password is None):
-        raise UnsupportedProfile("username and password must be paired")
-    if username is not None and (username, password) != ("vpn", "vpn"):
-        raise UnsupportedProfile("only public default credentials supported")
-
-    data_ciphers = parsed_endpoint.get("data_ciphers", [])
-    if not isinstance(data_ciphers, list) or not data_ciphers:
-        raise UnsupportedProfile("data_ciphers missing")
-    if any(not isinstance(c, str) or c not in CIPHERS for c in data_ciphers):
-        raise UnsupportedProfile("unsupported data-ciphers")
-
-    fallback = parsed_endpoint.get("data_ciphers_fallback")
-    if not isinstance(fallback, str) or fallback not in CIPHERS:
-        raise UnsupportedProfile("unsupported data-ciphers-fallback")
-
-    auth = parsed_endpoint.get("auth")
-    if not isinstance(auth, str) or auth not in AUTHS:
-        raise UnsupportedProfile("unsupported auth")
+    validated_ca_certs, cert_pem, key_pem = _validated_identity(tls, commands)
+    remote_cert_tls, remote_cert_eku, server_name, server_name_type = _validate_server_identity(tls)
+    wrap_path, wrap_direction, wrap_type, key_material = _validate_control_wrap(tls.get("control_wrap"))
+    username, password, data_ciphers, fallback, auth = _validated_crypto_options(parsed_endpoint)
 
     # Write files under private_dir.
     ca_path = private_dir / "ca.pem"
@@ -239,8 +249,10 @@ def synthesize_openvpn_config(
         lines.append(f"remote-cert-tls {remote_cert_tls}")
     if server_name is not None:
         lines.append(f"verify-x509-name {_quote_word(server_name)} {_quote_word(server_name_type)}")
-    lines.append(f"data-ciphers {':'.join(data_ciphers)}")
-    lines.append(f"data-ciphers-fallback {fallback}")
-    lines.append(f"auth {auth}")
+    lines.extend((
+        f"data-ciphers {':'.join(data_ciphers)}",
+        f"data-ciphers-fallback {fallback}",
+        f"auth {auth}",
+    ))
 
     return ("\n".join(lines) + "\n").encode()

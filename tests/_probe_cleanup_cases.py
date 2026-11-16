@@ -9,7 +9,7 @@ from unittest.mock import patch
 from tests._fake_runner import FakeRunner
 from tests._probe_round3 import _candidate
 from vpn_orbit.geoip import GeoDecision
-from vpn_orbit.isolation import remove_resources
+from vpn_orbit.isolation import _restore_ip_forward, remove_resources
 from vpn_orbit.openvpn_probe import ProbeStatus, probe_one
 from vpn_orbit.probe_commands import Commands
 from vpn_orbit.runner_types import IsolationResources
@@ -52,6 +52,12 @@ class CleanupCommands(Commands):
 
 
 class CleanupConfirmationTests(unittest.TestCase):
+    def test_untrusted_ip_forward_value_is_never_written(self):
+        with patch.object(Path, "write_text") as write_text:
+            result = _restore_ip_forward("../../tmp/attacker")
+        self.assertFalse(result)
+        write_text.assert_not_called()
+
     def test_nonzero_delete_is_not_ignored_even_if_resource_disappears(self):
         with tempfile.TemporaryDirectory() as directory:
             r = IsolationResources(netns="vo-test", private_dir=Path(directory) / "private",
