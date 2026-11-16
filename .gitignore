@@ -6,6 +6,7 @@ __pycache__/
 *.json
 !tests/fixtures/*.json
 .profile-output/
+.worktrees/
 
 # Local Cloudflare account configuration only (never commit)
 worker/wrangler.jsonc

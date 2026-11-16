@@ -1,0 +1,28 @@
+name: Tokyo VPN feasibility probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vpn-orbit-tokyo-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install explicit probe dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y openvpn iproute2 nftables curl openssl libc-bin
+      - name: Run isolated feasibility probe
+        env:
+          IPAPI_IS_API_KEY: ${{ secrets.IPAPI_IS_API_KEY }}
+        run: sudo --preserve-env=IPAPI_IS_API_KEY -- python3 -m vpn_orbit.cloud_probe --scan-window 40 --limit 10 --timeout-seconds 60
