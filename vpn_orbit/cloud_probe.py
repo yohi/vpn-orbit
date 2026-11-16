@@ -183,6 +183,16 @@ def screen_candidates(
 
 
 @dataclass(frozen=True, slots=True)
+class CandidateDiagnostic:
+    index: int
+    status: str
+    phase: str
+    elapsed_ms: int
+    cleanup_status: str
+    reason_code: str
+
+
+@dataclass(frozen=True, slots=True)
 class ProbeSummary:
     status: str
     tested_count: int = 0
@@ -190,6 +200,7 @@ class ProbeSummary:
     witness_ingress: str | None = None
     witness_exit: str | None = None
     reason_codes: tuple[str, ...] = ()
+    candidate_diagnostics: tuple[CandidateDiagnostic, ...] = ()
 
 
 class _SummaryParser(argparse.ArgumentParser):
@@ -209,6 +220,12 @@ def _summarize_results(results: list[ProbeResult]) -> ProbeSummary:
         f"{witness.ingress_ip}:{witness.port}/{witness.protocol}" if witness else None,
         witness.exit_ip if witness else None,
         tuple(sorted({result.reason_code for result in results})),
+        tuple(CandidateDiagnostic(
+            index=index, status=result.status.value,
+            phase=result.phase, elapsed_ms=result.elapsed_ms,
+            cleanup_status=result.cleanup_status,
+            reason_code=result.reason_code,
+        ) for index, result in enumerate(results, start=1)),
     )
 
 

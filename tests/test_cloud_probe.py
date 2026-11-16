@@ -375,12 +375,17 @@ class CloudProbeCliTests(unittest.TestCase):
                                      ("RAW_OVPN_SECRET",))
                 code, summary, _ = self.invoke([result])
                 self.assertEqual(set(summary), {"status", "tested_count", "tokyo_confirmed_count",
-                                               "witness_ingress", "witness_exit", "reason_codes"})
+                                               "witness_ingress", "witness_exit", "reason_codes",
+                                               "candidate_diagnostics"})
                 self.assertEqual(summary["status"], status.value)
                 self.assertEqual(summary["tested_count"], 1)
                 self.assertEqual(summary["tokyo_confirmed_count"], int(status == ProbeStatus.PASS))
                 self.assertEqual(code, int(status != ProbeStatus.PASS))
                 self.assertNotIn("RAW_OVPN_SECRET", json.dumps(summary))
+                self.assertEqual(summary["candidate_diagnostics"], [{
+                    "index": 1, "status": status.value, "phase": "not_started",
+                    "elapsed_ms": 0, "cleanup_status": "not_required", "reason_code": "ok",
+                }])
                 if status == ProbeStatus.PASS:
                     self.assertEqual(summary["witness_ingress"], "8.8.8.8:1195/udp")
                     self.assertEqual(summary["witness_exit"], "1.1.1.1")

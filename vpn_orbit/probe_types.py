@@ -19,3 +19,6 @@ class ProbeResult:
     status: ProbeStatus
     reason_code: str
     evidence: tuple[str, ...] = ()
+    phase: str = "not_started"
+    elapsed_ms: int = 0
+    cleanup_status: str = "not_required"

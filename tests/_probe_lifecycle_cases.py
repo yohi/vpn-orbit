@@ -9,7 +9,7 @@ from tests._probe_fixtures import _candidate
 from vpn_orbit.geoip import GeoDecision
 import vpn_orbit.openvpn_probe as openvpn_probe
 from vpn_orbit.openvpn_probe import ProbeStatus, probe_candidates, probe_one
-from vpn_orbit.probe_lifecycle import bounded
+from vpn_orbit.probe_lifecycle import ProbeDeadline, bounded
 
 
 class LifecycleTests(unittest.TestCase):
@@ -41,6 +41,29 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].status, ProbeStatus.NOT_VERIFIED)
         self.assertEqual(results[0].reason_code, "probe_exception:RuntimeError")
+
+    def test_deadline_reports_tun_wait_and_redacted_cleanup(self):
+        class DeadlineRunner(FakeRunner):
+            def wait_for_tun(self, *args, **kwargs):
+                raise ProbeDeadline("must-not-appear-in-output")
+
+        runner = DeadlineRunner(self.tmp)
+        result = probe_one(_candidate(self.tmp), geo_lookup=lambda _: GeoDecision.UNKNOWN, runner=runner)
+        self.assertEqual(result.status, ProbeStatus.NOT_VERIFIED)
+        self.assertEqual(result.reason_code, "probe_exception:ProbeDeadline")
+        self.assertEqual(result.phase, "tun_wait")
+        self.assertEqual(result.cleanup_status, "confirmed")
+        self.assertGreaterEqual(result.elapsed_ms, 0)
+        self.assertNotIn("must-not-appear-in-output", str(result))
+
+    def test_cleanup_failure_cannot_be_reported_as_success(self):
+        runner = FakeRunner(self.tmp)
+        runner.teardown_isolation = lambda resources: (False, "secret-not-logged")
+        result = probe_one(_candidate(self.tmp), geo_lookup=lambda _: GeoDecision.TOKYO, runner=runner)
+        self.assertEqual(result.status, ProbeStatus.FAIL)
+        self.assertEqual(result.phase, "cleanup")
+        self.assertEqual(result.cleanup_status, "failed")
+        self.assertNotIn("secret-not-logged", str(result))
 
     def test_probe_candidates_stops_after_cleanup_failure(self):
         candidate = _candidate(self.tmp)
