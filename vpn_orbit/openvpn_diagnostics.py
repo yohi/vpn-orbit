@@ -99,9 +99,15 @@ def classify_openvpn_log(path: Path) -> str:
 
 
 def advance_progress(previous: str, current: str) -> str:
-    """Keep the furthest *observed* phase if log tail rotates/truncates."""
-    if previous not in OPENVPN_PROGRESS_CODES or current not in OPENVPN_PROGRESS_CODES:
+    """Keep furthest connection progress; track latest pre-progress log state."""
+    if (type(previous) is not str or type(current) is not str
+            or previous not in OPENVPN_PROGRESS_CODES
+            or current not in OPENVPN_PROGRESS_CODES):
         return "not_observed"
+    if current == "not_observed":
+        return previous
+    if _PROGRESS_ORDER[current] == 0:
+        return previous if _PROGRESS_ORDER[previous] > 0 else current
     return current if _PROGRESS_ORDER[current] > _PROGRESS_ORDER[previous] else previous
 
 

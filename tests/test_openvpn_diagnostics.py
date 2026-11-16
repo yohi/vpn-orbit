@@ -69,6 +69,29 @@ class OpenVPNDiagnosticTests(unittest.TestCase):
             self.assertEqual(advance_progress('remote_selected', 'tls_packet_seen'), 'tls_packet_seen')
             self.assertEqual(advance_progress('evil_secret', 'tls_packet_seen'), 'not_observed')
 
+    def test_pre_progress_log_state_is_observable(self):
+        # No log, and a readable log without progress, are distinct observations.
+        self.assertEqual(advance_progress("not_observed", "log_unavailable"), "log_unavailable")
+        self.assertEqual(advance_progress("not_observed", "no_progress_signal"), "no_progress_signal")
+        self.assertEqual(advance_progress("log_unavailable", "no_progress_signal"), "no_progress_signal")
+        self.assertEqual(advance_progress("no_progress_signal", "log_unavailable"), "log_unavailable")
+        self.assertEqual(advance_progress("log_unavailable", "not_observed"), "log_unavailable")
+
+    def test_observed_connection_progress_cannot_regress(self):
+        for current in ("not_observed", "log_unavailable", "no_progress_signal",
+                        "remote_selected", "transport_connected", "tls_packet_seen"):
+            with self.subTest(current=current):
+                self.assertEqual(advance_progress("peer_connected", current), "peer_connected")
+        self.assertEqual(advance_progress("remote_selected", "tls_packet_seen"), "tls_packet_seen")
+
+    def test_unknown_progress_codes_fail_closed(self):
+        for previous, current in (("secret_marker", "tls_packet_seen"),
+                                  ("remote_selected", "secret_marker"),
+                                  (None, "remote_selected"),
+                                  ("not_observed", None)):
+            with self.subTest(previous=previous, current=current):
+                self.assertEqual(advance_progress(previous, current), "not_observed")
+
     def test_link_packets_are_only_advisory_codes(self):
         for rx, tx, expected in ((0, 0, 'no_packets'), (0, 5, 'tx_only'),
                                  (2, 0, 'rx_only'), (4, 3, 'bidirectional')):
