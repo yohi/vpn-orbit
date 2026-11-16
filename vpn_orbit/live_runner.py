@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .isolation import ns_command, provision
 from .probe_commands import Commands
+from .openvpn_diagnostics import classify_openvpn_log
 from .runner_types import CurlOutcome, IsolationResources, ProcessHandle
 from .supervisor_client import SupervisedProcess, SupervisorClient
 
@@ -24,6 +25,7 @@ class SubprocessRunner:
         self.resources: IsolationResources | None = None
         self.default_routes = ""
         self.cleanup_ok = False
+        self.openvpn_failure_code = "not_observed"
 
     def prerequisites_ok(self) -> bool:
         return os.geteuid() == 0 and Path("/dev/net/tun").exists() and all(
@@ -59,8 +61,10 @@ class SubprocessRunner:
 
     def wait_for_tun(self, process: ProcessHandle, resources: IsolationResources,
                      deadline: float) -> tuple[str | None, str]:
+        log = resources.private_dir / "openvpn.log"
         while time.monotonic() < deadline and process.poll() is None:
-            log = resources.private_dir / "openvpn.log"
+            # Advisory only: do not expose raw log text outside private storage.
+            self.openvpn_failure_code = classify_openvpn_log(log)
             if log.exists() and "Initialization Sequence Completed" in log.read_text(errors="replace"):
                 result = self.commands.run(ns_command(resources, "ip", "-j", "-4", "addr", "show", "dev", "tun0"))
                 if result.returncode == 0:
@@ -69,6 +73,8 @@ class SubprocessRunner:
                             if addr.get("family") == "inet":
                                 return str(ipaddress.IPv4Address(addr["local"])), "tls_established"
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        # Capture a quick process exit before the first log poll.
+        self.openvpn_failure_code = classify_openvpn_log(log)
         return None, "tun_unavailable"
 
     def resolve_host(self, hostname: str, deadline: float) -> tuple[str | None, str]:

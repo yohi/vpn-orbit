@@ -54,6 +54,20 @@ class LiveRunnerTests(unittest.TestCase):
         self.runner.commands = self.commands
         self.runner.resources = self.r
 
+    def test_short_lived_openvpn_error_reports_fixed_code_only(self):
+        class ExitedProcess:
+            def poll(self):
+                return 1
+
+        (self.r.private_dir / "openvpn.log").write_text(
+            "VERIFY ERROR: test certificate failure, secret=DO_NOT_PRINT"
+        )
+        result, reason = self.runner.wait_for_tun(ExitedProcess(), self.r, self.r.deadline)
+        self.assertIsNone(result)
+        self.assertEqual(reason, "tun_unavailable")
+        self.assertEqual(self.runner.openvpn_failure_code, "tls_verification_failed")
+        self.assertNotIn("DO_NOT_PRINT", self.runner.openvpn_failure_code)
+
     def test_actual_setup_commands_confine_remote_and_drop_other_traffic(self):
         # Given a real command builder with the privileged syscall seam recorded.
         with patch("vpn_orbit.isolation.Path.write_text") as forward:

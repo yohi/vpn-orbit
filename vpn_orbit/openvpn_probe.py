@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, assert_never
 
 from .config_synthesis import _reject_env_secrets, synthesize_openvpn_config
 from .geoip import GeoDecision
+from .openvpn_diagnostics import OPENVPN_DIAGNOSTIC_CODES
 from .phase1 import UnsupportedProfile, convert_ovpn
 from .probe_commands import IsolationUnavailable
 from .probe_lifecycle import bounded, cleanup
@@ -224,6 +225,12 @@ def probe_one(candidate: ScreenedCandidate, *, geo_lookup: Callable[[str], GeoDe
             state.evidence.append("cleanup_complete")
             if state.resources is not None:
                 cleanup_status = "confirmed"
+    # Fixed advisory code only: the original status, safety gates and cleanup
+    # precedence remain unchanged, including when OpenVPN logs are hostile.
+    if final_phase == "tun_wait" and status == ProbeStatus.NOT_VERIFIED:
+        hint = getattr(runner, "openvpn_failure_code", "not_observed")
+        if isinstance(hint, str) and hint in OPENVPN_DIAGNOSTIC_CODES and hint != "not_observed":
+            reason += ":openvpn_" + hint
     elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
     return ProbeResult(candidate.remote.ip, candidate.remote.port, candidate.remote.protocol,
                        exit_ip, status, reason, tuple(state.evidence),
