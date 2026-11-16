@@ -12,7 +12,9 @@ from typing import TYPE_CHECKING, assert_never
 
 from .config_synthesis import _reject_env_secrets, synthesize_openvpn_config
 from .geoip import GeoDecision
-from .openvpn_diagnostics import OPENVPN_DIAGNOSTIC_CODES
+from .openvpn_diagnostics import (
+    OPENVPN_DIAGNOSTIC_CODES, OPENVPN_PROGRESS_CODES, PROCESS_STATES, LINK_IO_CODES,
+)
 from .phase1 import UnsupportedProfile, convert_ovpn
 from .probe_commands import IsolationUnavailable
 from .probe_lifecycle import bounded, cleanup
@@ -231,10 +233,19 @@ def probe_one(candidate: ScreenedCandidate, *, geo_lookup: Callable[[str], GeoDe
         hint = getattr(runner, "openvpn_failure_code", "not_observed")
         if isinstance(hint, str) and hint in OPENVPN_DIAGNOSTIC_CODES and hint != "not_observed":
             reason += ":openvpn_" + hint
+    # These observations are optional, fixed codes only, and never alter PASS,
+    # FAIL, NOT_VERIFIED, or cleanup precedence.
+    def safe_code(attribute: str, allowed: frozenset[str], default: str) -> str:
+        value = getattr(runner, attribute, default)
+        return value if type(value) is str and value in allowed else default
+
+    progress = safe_code("openvpn_progress", OPENVPN_PROGRESS_CODES, "not_observed")
+    process_state = safe_code("openvpn_process_state", PROCESS_STATES, "not_started")
+    link_io = safe_code("link_io", LINK_IO_CODES, "not_observed")
     elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
     return ProbeResult(candidate.remote.ip, candidate.remote.port, candidate.remote.protocol,
                        exit_ip, status, reason, tuple(state.evidence),
-                       final_phase, elapsed_ms, cleanup_status)
+                       final_phase, elapsed_ms, cleanup_status, progress, process_state, link_io)
 
 
 def probe_candidates(candidates: list[ScreenedCandidate], *,

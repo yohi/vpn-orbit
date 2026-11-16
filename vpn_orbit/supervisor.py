@@ -117,11 +117,12 @@ def serve(channel: socket.socket, resources: IsolationResources) -> None:
                 case "start":
                     log_path = resources.private_dir / "openvpn.log"
                     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    # Private 0600 log captures both streams; never write it to Actions logs.
                     with os.fdopen(fd, "wb") as log:
                         proc = subprocess.Popen(["ip", "netns", "exec", resources.netns,
                             "openvpn", "--config", str(resources.private_dir / "client.ovpn"),
                             "--verb", "3"], stdin=subprocess.DEVNULL, stdout=log,
-                            stderr=subprocess.DEVNULL, cwd=resources.private_dir,
+                            stderr=subprocess.STDOUT, cwd=resources.private_dir,
                             env=SAFE_ENV, start_new_session=True)
                     reply = {"ok": True, "pid": proc.pid}
                 case "poll":

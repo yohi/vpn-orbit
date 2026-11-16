@@ -59,6 +59,9 @@ class LifecycleTests(unittest.TestCase):
     def test_tun_timeout_attaches_fixed_hint_and_preserves_cleanup(self):
         class DeadlineRunner(FakeRunner):
             openvpn_failure_code = "tls_handshake_failed"
+            openvpn_progress = "tls_packet_seen"
+            openvpn_process_state = "running"
+            link_io = "tx_only"
 
             def wait_for_tun(self, *args, **kwargs):
                 raise ProbeDeadline("UNTRUSTED_SECRET")
@@ -68,11 +71,17 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(result.reason_code, "probe_exception:ProbeDeadline:openvpn_tls_handshake_failed")
         self.assertEqual(result.phase, "tun_wait")
         self.assertEqual(result.cleanup_status, "confirmed")
+        self.assertEqual(result.openvpn_progress, "tls_packet_seen")
+        self.assertEqual(result.openvpn_process_state, "running")
+        self.assertEqual(result.link_io, "tx_only")
         self.assertNotIn("UNTRUSTED_SECRET", str(result))
 
     def test_unknown_openvpn_hint_is_rejected(self):
         class DeadlineRunner(FakeRunner):
             openvpn_failure_code = "SECRET_DO_NOT_EMIT"
+            openvpn_progress = "SECRET_DO_NOT_EMIT"
+            openvpn_process_state = "SECRET_DO_NOT_EMIT"
+            link_io = "SECRET_DO_NOT_EMIT"
 
             def wait_for_tun(self, *args, **kwargs):
                 raise ProbeDeadline("ALSO_SECRET")
@@ -80,6 +89,9 @@ class LifecycleTests(unittest.TestCase):
         result = probe_one(_candidate(self.tmp), geo_lookup=lambda _: GeoDecision.UNKNOWN,
                            runner=DeadlineRunner(self.tmp))
         self.assertEqual(result.reason_code, "probe_exception:ProbeDeadline")
+        self.assertEqual(result.openvpn_progress, "not_observed")
+        self.assertEqual(result.openvpn_process_state, "not_started")
+        self.assertEqual(result.link_io, "not_observed")
         self.assertNotIn("SECRET", str(result))
 
     def test_cleanup_failure_cannot_be_reported_as_success(self):

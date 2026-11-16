@@ -68,6 +68,40 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertEqual(self.runner.openvpn_failure_code, "tls_verification_failed")
         self.assertNotIn("DO_NOT_PRINT", self.runner.openvpn_failure_code)
 
+    def test_process_exit_and_progress_are_fixed_codes(self):
+        class Exited:
+            def poll(self):
+                return 1
+
+        (self.r.private_dir / "openvpn.log").write_text(
+            "TLS: Initial packet from 8.8.8.8; VERIFY ERROR: SECRET_NOT_TO_LOG"
+        )
+        tun, code = self.runner.wait_for_tun(Exited(), self.r, self.r.deadline)
+        self.assertIsNone(tun)
+        self.assertEqual(code, "tun_unavailable")
+        self.assertEqual(self.runner.openvpn_process_state, "exited")
+        self.assertEqual(self.runner.openvpn_progress, "tls_packet_seen")
+        self.assertEqual(self.runner.openvpn_failure_code, "tls_verification_failed")
+
+    def test_passive_link_io_observation_only_reads_veth_statistics(self):
+        report = json.dumps([{"ifname": "vn-test", "stats64": {
+            "rx": {"packets": 2}, "tx": {"packets": 3},
+        }}])
+        with patch.object(self.commands, "run",
+                          return_value=subprocess.CompletedProcess([], 0, report, "")) as run:
+            self.runner._sample_link_io(self.r)
+        self.assertEqual(self.runner.link_io, "bidirectional")
+        self.assertEqual(run.call_args.args[0], [
+            "ip", "netns", "exec", "vo-test", "ip", "-s", "-j",
+            "link", "show", "dev", "vn-test",
+        ])
+        self.assertNotIn("SECRET", self.runner.link_io)
+
+    def test_passive_link_io_failure_does_not_raise(self):
+        with patch.object(self.commands, "run", side_effect=OSError("SENSITIVE_LOG")):
+            self.runner._sample_link_io(self.r)
+        self.assertEqual(self.runner.link_io, "unavailable")
+
     def test_actual_setup_commands_confine_remote_and_drop_other_traffic(self):
         # Given a real command builder with the privileged syscall seam recorded.
         with patch("vpn_orbit.isolation.Path.write_text") as forward:

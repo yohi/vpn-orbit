@@ -385,6 +385,9 @@ class CloudProbeCliTests(unittest.TestCase):
                 self.assertEqual(summary["candidate_diagnostics"], [{
                     "index": 1, "status": status.value, "phase": "not_started",
                     "elapsed_ms": 0, "cleanup_status": "not_required", "reason_code": "ok",
+                    "openvpn_progress": "not_observed",
+                    "openvpn_process_state": "not_started",
+                    "link_io": "not_observed",
                 }])
                 if status == ProbeStatus.PASS:
                     self.assertEqual(summary["witness_ingress"], "8.8.8.8:1195/udp")
@@ -392,6 +395,20 @@ class CloudProbeCliTests(unittest.TestCase):
                 else:
                     self.assertIsNone(summary["witness_ingress"])
                     self.assertIsNone(summary["witness_exit"])
+
+    def test_untrusted_optional_diagnostic_codes_are_redacted(self):
+        result = ProbeResult(
+            "8.8.8.8", 1195, "udp", None, ProbeStatus.NOT_VERIFIED, "tun_not_established",
+            openvpn_progress="UNTRUSTED_SECRET",
+            openvpn_process_state="UNTRUSTED_SECRET",
+            link_io="UNTRUSTED_SECRET",
+        )
+        _, summary, _ = self.invoke([result])
+        diag = summary["candidate_diagnostics"][0]
+        self.assertEqual(diag["openvpn_progress"], "not_observed")
+        self.assertEqual(diag["openvpn_process_state"], "not_started")
+        self.assertEqual(diag["link_io"], "not_observed")
+        self.assertNotIn("UNTRUSTED_SECRET", json.dumps(summary))
 
     def test_empty_shortlist_is_not_verified(self):
         code, summary, _ = self.invoke()

@@ -22,3 +22,6 @@ class ProbeResult:
     phase: str = "not_started"
     elapsed_ms: int = 0
     cleanup_status: str = "not_required"
+    openvpn_progress: str = "not_observed"
+    openvpn_process_state: str = "not_started"
+    link_io: str = "not_observed"

@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 from typing import Callable, Iterable, Literal, NoReturn
 
 from .geoip import GeoDecision, lookup_geoip
+from .openvpn_diagnostics import OPENVPN_PROGRESS_CODES, PROCESS_STATES, LINK_IO_CODES
 from .openvpn_probe import ProbeResult, ProbeStatus, probe_candidates, probe_one
 from .phase1 import Candidate, convert_ovpn, fetch_catalog, parse_catalog
 
@@ -190,6 +191,9 @@ class CandidateDiagnostic:
     elapsed_ms: int
     cleanup_status: str
     reason_code: str
+    openvpn_progress: str
+    openvpn_process_state: str
+    link_io: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +229,18 @@ def _summarize_results(results: list[ProbeResult]) -> ProbeSummary:
             phase=result.phase, elapsed_ms=result.elapsed_ms,
             cleanup_status=result.cleanup_status,
             reason_code=result.reason_code,
+            openvpn_progress=(
+                result.openvpn_progress if type(result.openvpn_progress) is str
+                and result.openvpn_progress in OPENVPN_PROGRESS_CODES else "not_observed"
+            ),
+            openvpn_process_state=(
+                result.openvpn_process_state if type(result.openvpn_process_state) is str
+                and result.openvpn_process_state in PROCESS_STATES else "not_started"
+            ),
+            link_io=(
+                result.link_io if type(result.link_io) is str
+                and result.link_io in LINK_IO_CODES else "not_observed"
+            ),
         ) for index, result in enumerate(results, start=1)),
     )
 

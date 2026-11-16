@@ -9,7 +9,9 @@ from pathlib import Path
 
 from .isolation import ns_command, provision
 from .probe_commands import Commands
-from .openvpn_diagnostics import classify_openvpn_log
+from .openvpn_diagnostics import (
+    advance_progress, classify_link_io, observe_openvpn_log,
+)
 from .runner_types import CurlOutcome, IsolationResources, ProcessHandle
 from .supervisor_client import SupervisedProcess, SupervisorClient
 
@@ -26,6 +28,9 @@ class SubprocessRunner:
         self.default_routes = ""
         self.cleanup_ok = False
         self.openvpn_failure_code = "not_observed"
+        self.openvpn_progress = "not_observed"
+        self.openvpn_process_state = "not_started"
+        self.link_io = "not_observed"
 
     def prerequisites_ok(self) -> bool:
         return os.geteuid() == 0 and Path("/dev/net/tun").exists() and all(
@@ -59,22 +64,50 @@ class SubprocessRunner:
         reply = self.client.request("start")
         return SupervisedProcess(self.client, reply["pid"])
 
+    def _observe_openvpn(self, log: Path) -> None:
+        # Never publish log content; fixed codes are the only observable output.
+        failure, progress = observe_openvpn_log(log)
+        self.openvpn_failure_code = failure
+        self.openvpn_progress = advance_progress(self.openvpn_progress, progress)
+
+    def _sample_link_io(self, resources: IsolationResources) -> None:
+        # Passive *veth* counters (may include ARP); not proof of VPN peer replies.
+        try:
+            result = self.commands.run(ns_command(
+                resources, "ip", "-s", "-j", "link", "show", "dev", resources.veth_ns,
+            ))
+            self.link_io = (
+                classify_link_io(result.stdout, resources.veth_ns)
+                if result.returncode == 0 else "unavailable"
+            )
+        except Exception as exc:  # Advisory metric failure never relaxes safety checks.
+            if isinstance(exc, TimeoutError):
+                raise  # Preserve SIGALRM/ProbeDeadline fail-closed behavior.
+            self.link_io = "unavailable"
+
     def wait_for_tun(self, process: ProcessHandle, resources: IsolationResources,
                      deadline: float) -> tuple[str | None, str]:
         log = resources.private_dir / "openvpn.log"
-        while time.monotonic() < deadline and process.poll() is None:
-            # Advisory only: do not expose raw log text outside private storage.
-            self.openvpn_failure_code = classify_openvpn_log(log)
-            if log.exists() and "Initialization Sequence Completed" in log.read_text(errors="replace"):
+        next_io_sample = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            code = process.poll()
+            self.openvpn_process_state = "running" if code is None else "exited"
+            self._observe_openvpn(log)
+            if code is not None:
+                break
+            if self.openvpn_progress == "initialized":
                 result = self.commands.run(ns_command(resources, "ip", "-j", "-4", "addr", "show", "dev", "tun0"))
                 if result.returncode == 0:
                     for row in json.loads(result.stdout):
                         for addr in row.get("addr_info", []):
                             if addr.get("family") == "inet":
                                 return str(ipaddress.IPv4Address(addr["local"])), "tls_established"
+            now = time.monotonic()
+            if now >= next_io_sample and deadline - now > 6.0:
+                self._sample_link_io(resources)
+                next_io_sample = now + 20.0
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
-        # Capture a quick process exit before the first log poll.
-        self.openvpn_failure_code = classify_openvpn_log(log)
+        self._observe_openvpn(log)  # Catch a process that exited before first poll.
         return None, "tun_unavailable"
 
     def resolve_host(self, hostname: str, deadline: float) -> tuple[str | None, str]:
