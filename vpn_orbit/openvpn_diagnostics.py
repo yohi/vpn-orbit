@@ -80,7 +80,8 @@ def _progress_code(log: str) -> str:
         return "tls_packet_seen"
     if "tcp connection established" in log:
         return "transport_connected"
-    if "udp link remote:" in log or "tcpv4_client link remote:" in log or "tcpv6_client link remote:" in log:
+    # OpenVPN 2.4+ prints e.g. "UDPv4 link remote:" / "TCPv4_CLIENT link remote:".
+    if "link remote:" in log:
         return "remote_selected"
     return "no_progress_signal"
 
