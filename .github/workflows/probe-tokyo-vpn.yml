@@ -22,6 +22,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y openvpn iproute2 nftables curl openssl libc-bin
+      - name: Runner forwarding diagnostics (non-secret)
+        continue-on-error: true
+        run: |
+          sudo iptables -S FORWARD 2>&1 | head -20
+          sudo iptables -S DOCKER-USER 2>&1 | head -10
+          sudo nft list tables 2>&1 | head -20
+          sysctl net.ipv4.ip_forward net.ipv4.conf.all.rp_filter
       - name: Run isolated feasibility probe
         env:
           IPAPI_IS_API_KEY: ${{ secrets.IPAPI_IS_API_KEY }}
