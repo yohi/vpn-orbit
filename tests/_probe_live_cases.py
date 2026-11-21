@@ -148,13 +148,29 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertNotIn("-k", args)
         self.assertNotIn("--location", args)
 
+    def test_direct_rejection_ignores_route_get_exit_but_requires_curl_refusal(self):
+        # Real kernels return 0 for `route get ... oif DEV` (assumed on-link).
+        from unittest import mock
+        def fake(curl_rc):
+            def run(args, *, data=None):
+                rc = 0 if "route" in args else curl_rc
+                return subprocess.CompletedProcess(args, rc, "", "")
+            return run
+        with mock.patch.object(self.commands, "run", side_effect=fake(28)):
+            ok, detail = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
+        self.assertTrue(ok)
+        self.assertEqual(detail, "route_exit_0;curl_exit_28")
+        with mock.patch.object(self.commands, "run", side_effect=fake(0)):
+            ok, _ = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
+        self.assertFalse(ok)
+
     def test_direct_route_rejection_uses_veth_not_host_echo(self):
         # Given the actual adapter after the tunnel is up.
         # When the bypass is tested.
         ok, detail = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
         # Then route and connection refusal are both required inside the namespace.
         self.assertTrue(ok)
-        self.assertEqual(detail, "route_exit_2;curl_exit_7")
+        self.assertEqual(detail, "route_exit_2;curl_exit_7")  # route exit is informational
         route, curl = [args for args, _ in self.commands.calls]
         self.assertEqual(route[-2:], ["oif", "vn-test"])
-        self.assertEqual(curl[curl.index("--interface") + 1], "vn-test")
+        self.assertEqual(curl[curl.index("--interface") + 1], "if!vn-test")

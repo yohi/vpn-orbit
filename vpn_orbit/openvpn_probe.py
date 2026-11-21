@@ -114,7 +114,8 @@ def _verify_routes(
     evidence.append("echo_route:" + detail)
     ok, detail = runner.host_direct_route_rejected(echo_ip, resources, work_deadline)
     if not ok:
-        return ProbeStatus.FAIL, "host_direct_echo_route"
+        # detail is fixed-format exit codes only (route_exit_N;curl_exit_N)
+        return ProbeStatus.FAIL, "host_direct_echo_route:" + detail
     evidence.append("host_direct_rejected:" + detail)
     return None
 
