@@ -12,6 +12,60 @@ def ns_command(resources: IsolationResources, *args: str) -> list[str]:
     return ["ip", "netns", "exec", resources.netns, *args]
 
 
+_IPT = ["iptables", "-w", "2"]
+
+
+def _forward_rules(r: IsolationResources) -> list[list[str]]:
+    """Scoped ACCEPT rules for the iptables FORWARD chain.
+
+    Hosted runners ship Docker, whose iptables FORWARD policy is DROP; an nft
+    accept in another base chain cannot override it. Rules are limited to the
+    isolation veth, the single remote tuple and return traffic, and are tagged
+    so cleanup can find them without extra state.
+    """
+    tag = ["-m", "comment", "--comment", f"vo:{r.table}", "-j", "ACCEPT"]
+    return [
+        ["-i", r.veth_host, "-s", "10.253.240.2", "-d", r.remote_ip,
+         "-p", r.protocol, "--dport", str(r.port), *tag],
+        ["-o", r.veth_host, "-s", r.remote_ip, "-d", "10.253.240.2",
+         "-p", r.protocol, "--sport", str(r.port),
+         "-m", "conntrack", "--ctstate", "ESTABLISHED", *tag],
+    ]
+
+
+def _install_forward_rules(r: IsolationResources, commands: Commands) -> None:
+    try:
+        commands.checked([*_IPT, "-S", "FORWARD"])
+    except IsolationUnavailable:
+        return  # no iptables on this host: no iptables FORWARD policy to satisfy
+    for rule in reversed(_forward_rules(r)):
+        commands.checked([*_IPT, "-I", "FORWARD", "1", *rule])
+
+
+def _remove_forward_rules(r: IsolationResources, commands: Commands) -> bool:
+    tag = f"vo:{r.table}"
+    try:
+        listing = commands.run([*_IPT, "-S", "FORWARD"])
+    except FileNotFoundError:
+        return True  # iptables absent: provisioning could not have added rules
+    except (OSError, TimeoutError, subprocess.SubprocessError):
+        return False
+    if listing.returncode != 0:
+        return shutil.which("iptables") is None
+    ok = True
+    if tag in listing.stdout:
+        for rule in _forward_rules(r):
+            try:
+                commands.run([*_IPT, "-D", "FORWARD", *rule])
+            except (OSError, TimeoutError, subprocess.SubprocessError):
+                ok = False
+    try:
+        after = commands.run([*_IPT, "-S", "FORWARD"])
+    except (OSError, TimeoutError, subprocess.SubprocessError):
+        return False
+    return ok and after.returncode == 0 and tag not in after.stdout
+
+
 def provision(resources: IsolationResources, commands: Commands) -> None:
     r = resources
     addresses = json.loads(commands.checked(["ip", "-j", "-4", "addr", "show"]))
@@ -63,6 +117,7 @@ def provision(resources: IsolationResources, commands: Commands) -> None:
 }}'''
     commands.checked(["nft", "-f", "-"], data=host_rules)
     commands.checked(ns_command(r, "nft", "-f", "-"), data=namespace_rules)
+    _install_forward_rules(r, commands)
     Path("/proc/sys/net/ipv4/ip_forward").write_text("1")
     commands.checked(["ip", "link", "set", r.veth_host, "up"])
 
@@ -124,6 +179,8 @@ def remove_resources(r: IsolationResources, commands: Commands) -> bool:
                 ok = False
         except (OSError, TimeoutError, subprocess.SubprocessError):
             ok = False
+    if not _remove_forward_rules(r, commands):
+        ok = False
     if r.host_ip_forward_original is not None:
         try:
             if not _restore_ip_forward(r.host_ip_forward_original):

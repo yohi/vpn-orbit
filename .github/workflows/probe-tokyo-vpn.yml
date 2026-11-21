@@ -21,7 +21,7 @@ jobs:
       - name: Install explicit probe dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y openvpn iproute2 nftables curl openssl libc-bin
+          sudo apt-get install --no-install-recommends -y openvpn iproute2 nftables iptables curl openssl libc-bin
       - name: Runner forwarding diagnostics (non-secret)
         continue-on-error: true
         run: |

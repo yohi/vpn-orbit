@@ -43,6 +43,8 @@ class CleanupCommands(Commands):
         elif args == ["nft", "-j", "list", "tables"]:
             body = json.dumps({"nftables": [{"table": {"family": "inet", "name": self.resources.table}}]
                                if "table" in self.present else []})
+        elif args[:3] == ["iptables", "-w", "2"]:
+            body = ""
         elif args == ["ip", "netns", "list"]:
             body = self.resources.netns if "netns" in self.present else ""
         else:
