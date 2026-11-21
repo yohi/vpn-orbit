@@ -11,7 +11,6 @@ import time
 import unittest
 from pathlib import Path
 
-from vpn_orbit.isolation import _install_forward_rules
 from vpn_orbit.runner_types import IsolationResources
 from vpn_orbit.probe_commands import CommandUnavailable, IsolationUnavailable
 from vpn_orbit.supervisor import serve
