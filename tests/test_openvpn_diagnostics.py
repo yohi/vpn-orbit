@@ -53,6 +53,7 @@ class OpenVPNDiagnosticTests(unittest.TestCase):
             'UDP link remote: [AF_INET]1.2.3.4:1195 SECRET': 'remote_selected',
             'UDPv4 link remote: [AF_INET]1.2.3.4:1195 SECRET': 'remote_selected',
             'TCPv4_CLIENT link remote: [AF_INET]1.2.3.4:443': 'remote_selected',
+            'Attempting to establish TCP connection with [AF_INET]1.2.3.4:443 [nonblock]': 'transport_connecting',
             'TCP connection established with 1.2.3.4': 'transport_connected',
             'TLS: Initial packet from 1.2.3.4:5678': 'tls_packet_seen',
             'Peer Connection Initiated with [AF_INET]1.2.3.4:5678': 'peer_connected',

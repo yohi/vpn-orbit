@@ -191,6 +191,7 @@ class CandidateDiagnostic:
     elapsed_ms: int
     cleanup_status: str
     reason_code: str
+    protocol: str
     openvpn_progress: str
     openvpn_process_state: str
     link_io: str
@@ -229,6 +230,7 @@ def _summarize_results(results: list[ProbeResult]) -> ProbeSummary:
             phase=result.phase, elapsed_ms=result.elapsed_ms,
             cleanup_status=result.cleanup_status,
             reason_code=result.reason_code,
+            protocol=result.protocol if result.protocol in ("tcp", "udp") else "unknown",
             openvpn_progress=(
                 result.openvpn_progress if type(result.openvpn_progress) is str
                 and result.openvpn_progress in OPENVPN_PROGRESS_CODES else "not_observed"

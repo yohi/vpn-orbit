@@ -384,7 +384,7 @@ class CloudProbeCliTests(unittest.TestCase):
                 self.assertNotIn("RAW_OVPN_SECRET", json.dumps(summary))
                 self.assertEqual(summary["candidate_diagnostics"], [{
                     "index": 1, "status": status.value, "phase": "not_started",
-                    "elapsed_ms": 0, "cleanup_status": "not_required", "reason_code": "ok",
+                    "elapsed_ms": 0, "cleanup_status": "not_required", "reason_code": "ok", "protocol": "udp",
                     "openvpn_progress": "not_observed",
                     "openvpn_process_state": "not_started",
                     "link_io": "not_observed",

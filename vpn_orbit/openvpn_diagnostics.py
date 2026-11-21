@@ -14,7 +14,7 @@ OPENVPN_DIAGNOSTIC_CODES = frozenset({
 })
 OPENVPN_PROGRESS_CODES = frozenset({
     "not_observed", "log_unavailable", "no_progress_signal", "remote_selected",
-    "transport_connected", "tls_packet_seen", "peer_connected", "initialized",
+    "transport_connecting", "transport_connected", "tls_packet_seen", "peer_connected", "initialized",
 })
 PROCESS_STATES = frozenset({"not_started", "running", "exited", "unknown"})
 LINK_IO_CODES = frozenset({
@@ -23,8 +23,8 @@ LINK_IO_CODES = frozenset({
 })
 _PROGRESS_ORDER = {
     "not_observed": 0, "log_unavailable": 0, "no_progress_signal": 0,
-    "remote_selected": 1, "transport_connected": 2,
-    "tls_packet_seen": 3, "peer_connected": 4, "initialized": 5,
+    "remote_selected": 1, "transport_connecting": 2, "transport_connected": 3,
+    "tls_packet_seen": 4, "peer_connected": 5, "initialized": 6,
 }
 
 
@@ -81,6 +81,8 @@ def _progress_code(log: str) -> str:
     if "tcp connection established" in log:
         return "transport_connected"
     # OpenVPN 2.4+ prints e.g. "UDPv4 link remote:" / "TCPv4_CLIENT link remote:".
+    if "attempting to establish tcp connection" in log:
+        return "transport_connecting"
     if "link remote:" in log:
         return "remote_selected"
     return "no_progress_signal"
