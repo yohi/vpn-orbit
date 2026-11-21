@@ -10,6 +10,7 @@ import argparse
 import ipaddress
 import json
 import os
+import socket
 from dataclasses import asdict, dataclass
 from typing import Callable, Iterable, Literal, NoReturn
 
@@ -24,6 +25,7 @@ __all__ = [
     "RemoteKey",
     "ScreenedCandidate",
     "screen_candidates",
+    "tcp_reachable",
     "probe_candidates",
     "ProbeStatus",
     "ProbeResult",
@@ -85,6 +87,24 @@ def _to_ip_int(ip: str) -> int:
     return int(ipaddress.IPv4Address(ip))
 
 
+_PREFLIGHT_TIMEOUT_S = 3.0
+
+
+def tcp_reachable(key: RemoteKey, timeout_s: float = _PREFLIGHT_TIMEOUT_S) -> bool:
+    """Bounded TCP connect check; UDP cannot be verified and is never filtered out.
+
+    RemoteKey guarantees a globally routable IPv4 address. Only a connect is
+    attempted: no data is sent and no response content is read or logged.
+    """
+    if key.protocol != "tcp":
+        return True
+    try:
+        with socket.create_connection((key.ip, key.port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
 def screen_candidates(
     catalog: str,
     *,
@@ -92,6 +112,7 @@ def screen_candidates(
     geo_lookup: Callable[[str], GeoDecision],
     scan_window: int = 40,
     limit: int = 10,
+    reachable: Callable[[RemoteKey], bool] | None = None,
 ) -> list[ScreenedCandidate]:
     """Return a deterministic shortlist of screened VPN Gate candidates."""
     if scan_window != _SCAN_WINDOW:
@@ -177,7 +198,17 @@ def screen_candidates(
         )))
 
     entries.sort(key=lambda item: item[0])
-    return [entry[1] for entry in entries[:limit]]
+    if reachable is None:
+        return [entry[1] for entry in entries[:limit]]
+    # Pre-flight stays inside the fixed scan window and keeps its ranking;
+    # it is evaluated lazily and stops once `limit` reachable candidates exist.
+    selected: list[ScreenedCandidate] = []
+    for _, screened in entries:
+        if reachable(screened.remote):
+            selected.append(screened)
+            if len(selected) >= limit:
+                break
+    return selected
 
 
 # probe_candidates is re-exported from openvpn_probe.
@@ -261,6 +292,7 @@ def _run_pipeline(args: argparse.Namespace) -> ProbeSummary:
         candidates = screen_candidates(
             fetch_catalog(), existing_pins=frozenset(), geo_lookup=geo_lookup,
             scan_window=args.scan_window, limit=args.limit,
+            reachable=tcp_reachable,
         )
         results = probe_candidates(
             candidates, geo_lookup=geo_lookup, timeout_s=args.timeout_seconds,

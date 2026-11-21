@@ -75,6 +75,39 @@ class ScreenCandidatesTests(unittest.TestCase):
         result = screen_candidates(_catalog(rows), existing_pins=frozenset(), geo_lookup=lookup, limit=10)
         self.assertEqual(len(result), 10)
 
+    def test_reachable_filter_skips_unreachable_and_keeps_order(self):
+        rows = [(f"8.8.{i}.8", "JP", i, _profile(f"8.8.{i}.8", 443, "tcp")) for i in range(1, 12)]
+        lookup, _ = _geo({row[0]: GeoDecision.TOKYO for row in rows})
+        dead = {"8.8.1.8", "8.8.2.8"}
+        checked: list[str] = []
+
+        def reachable(key):
+            checked.append(key.ip)
+            return key.ip not in dead
+
+        result = screen_candidates(_catalog(rows), existing_pins=frozenset(), geo_lookup=lookup,
+                                   limit=3, reachable=reachable)
+        self.assertEqual([r.remote.ip for r in result], ["8.8.3.8", "8.8.4.8", "8.8.5.8"])
+        self.assertEqual(len(checked), 5)  # lazy: stops once limit is reached
+
+    def test_reachable_filter_may_return_fewer_than_limit(self):
+        rows = [("8.8.1.8", "JP", 1, _profile("8.8.1.8", 443, "tcp"))]
+        lookup, _ = _geo({"8.8.1.8": GeoDecision.TOKYO})
+        result = screen_candidates(_catalog(rows), existing_pins=frozenset(), geo_lookup=lookup,
+                                   reachable=lambda key: False)
+        self.assertEqual(result, [])
+
+    def test_tcp_reachable_never_connects_for_udp_and_handles_errors(self):
+        from unittest import mock
+        from vpn_orbit.cloud_probe import RemoteKey, tcp_reachable
+        with mock.patch("vpn_orbit.cloud_probe.socket.create_connection") as conn:
+            self.assertTrue(tcp_reachable(RemoteKey("8.8.8.8", 1195, "udp")))
+            conn.assert_not_called()
+            conn.side_effect = TimeoutError
+            self.assertFalse(tcp_reachable(RemoteKey("8.8.8.8", 443, "tcp")))
+            conn.side_effect = None
+            self.assertTrue(tcp_reachable(RemoteKey("8.8.8.8", 443, "tcp")))
+
     def test_invalid_limit_rejected(self):
         with self.assertRaises(ValueError):
             screen_candidates(_catalog([]), existing_pins=frozenset(), geo_lookup=lambda ip: GeoDecision.UNKNOWN, limit=0)
