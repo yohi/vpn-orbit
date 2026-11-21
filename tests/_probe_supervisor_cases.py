@@ -11,7 +11,9 @@ import unittest
 from pathlib import Path
 
 from vpn_orbit.runner_types import IsolationResources
+from vpn_orbit.probe_commands import IsolationUnavailable
 from vpn_orbit.supervisor import serve
+from vpn_orbit.supervisor_client import SupervisorClient
 
 
 def _serve_with_tools(channel, other_fd, resources, binary_dir, state):
@@ -159,6 +161,26 @@ with socket.socket(fileno=int(sys.argv[1])) as channel:
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_missing_supervisor_reply_is_normalized(self):
+        client = SupervisorClient.__new__(SupervisorClient)
+        client.resources = type("Resources", (), {"deadline": time.monotonic() + 5})()
+        client.deadline = client.resources.deadline
+        client.channel = type("Channel", (), {
+            "settimeout": lambda self, timeout: None,
+            "send": lambda self, payload: None,
+            "recv": lambda self, size: b"",
+        })()
+
+        with self.assertRaises(IsolationUnavailable):
+            client.request("run")
+
+    def test_missing_command_code_is_normalized(self):
+        client = SupervisorClient.__new__(SupervisorClient)
+        client.request = lambda *args, **kwargs: {"ok": True, "code": None, "stdout": "", "pid": 0}
+
+        with self.assertRaises(IsolationUnavailable):
+            client.run(["iptables"])
+
     def test_sigkill_owner_kills_reaps_and_cleans(self):
         with tempfile.TemporaryDirectory() as directory:
             _check_supervisor_kills_reaps_and_cleans(Path(directory), "sigkill")

@@ -2,12 +2,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from vpn_orbit.openvpn_diagnostics import (
     OPENVPN_DIAGNOSTIC_CODES, OPENVPN_PROGRESS_CODES, PROCESS_STATES,
     LINK_IO_CODES, MAX_LOG_TAIL, advance_progress, classify_link_io,
     classify_openvpn_log, observe_openvpn_log,
 )
+from vpn_orbit.probe_lifecycle import ProbeDeadline
 
 
 class OpenVPNDiagnosticTests(unittest.TestCase):
@@ -41,6 +43,14 @@ class OpenVPNDiagnosticTests(unittest.TestCase):
             log.write_bytes(b'options error:' + b'Z' * 70000 + b'AUTH_FAILED secret')
             self.assertEqual(classify_openvpn_log(log), 'auth_failed')
             self.assertEqual(MAX_LOG_TAIL, 65536)
+
+    def test_probe_deadline_during_log_read_propagates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'openvpn.log'
+            log.touch()
+            with patch.object(Path, 'open', side_effect=ProbeDeadline('deadline')):
+                with self.assertRaises(ProbeDeadline):
+                    observe_openvpn_log(log)
 
     def test_priority_prefers_verification_over_handshake(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,6 +1,7 @@
 import threading
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -41,6 +42,32 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].status, ProbeStatus.NOT_VERIFIED)
         self.assertEqual(results[0].reason_code, "probe_exception:RuntimeError")
+
+    def test_shared_runner_diagnostics_do_not_leak_to_later_parse_failure(self):
+        class ObservingRunner(FakeRunner):
+            openvpn_failure_code = "not_observed"
+            openvpn_progress = "not_observed"
+            openvpn_process_state = "not_started"
+            link_io = "not_observed"
+
+            def wait_for_tun(self, *args, **kwargs):
+                self.openvpn_progress = "tls_packet_seen"
+                self.openvpn_process_state = "exited"
+                self.link_io = "tx_only"
+                return None, "unavailable"
+
+        runner = ObservingRunner(self.tmp)
+        valid = _candidate(self.tmp)
+        invalid = replace(valid, candidate=replace(valid.candidate, profile="invalid"))
+
+        results = probe_candidates(
+            [valid, invalid], geo_lookup=lambda _: GeoDecision.UNKNOWN, runner=runner,
+        )
+
+        self.assertEqual(results[1].reason_code, "profile_parse_failed")
+        self.assertEqual(results[1].openvpn_progress, "not_observed")
+        self.assertEqual(results[1].openvpn_process_state, "not_started")
+        self.assertEqual(results[1].link_io, "not_observed")
 
     def test_deadline_reports_tun_wait_and_redacted_cleanup(self):
         class DeadlineRunner(FakeRunner):

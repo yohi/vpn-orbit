@@ -254,6 +254,15 @@ def probe_candidates(candidates: list[ScreenedCandidate], *,
                      runner: ProbeRunner | None = None) -> list[ProbeResult]:
     results: list[ProbeResult] = []
     for candidate in candidates[:10]:
+        if runner is not None:
+            for attribute, initial in (
+                ("openvpn_failure_code", "not_observed"),
+                ("openvpn_progress", "not_observed"),
+                ("openvpn_process_state", "not_started"),
+                ("link_io", "not_observed"),
+            ):
+                if hasattr(runner, attribute):
+                    setattr(runner, attribute, initial)
         result = probe_one(candidate, geo_lookup=geo_lookup, timeout_s=timeout_s, runner=runner)
         results.append(result)
         if result.reason_code.startswith("cleanup_failed"):

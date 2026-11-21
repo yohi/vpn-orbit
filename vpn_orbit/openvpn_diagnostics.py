@@ -34,6 +34,8 @@ def _read_log_tail(path: Path) -> str | None:
             stream.seek(0, os.SEEK_END)
             stream.seek(max(0, stream.tell() - MAX_LOG_TAIL))
             return stream.read(MAX_LOG_TAIL).decode("utf-8", errors="replace").lower()
+    except TimeoutError:
+        raise
     except OSError:
         return None
 

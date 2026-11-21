@@ -72,6 +72,15 @@ class ForwardRuleTests(unittest.TestCase):
             r = _resources(Path(d))
             self.assertTrue(_remove_forward_rules(r, FakeIptables(available=False)))
 
+    def test_install_skips_forward_rules_when_iptables_is_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            commands = FakeIptables(available=False)
+
+            _install_forward_rules(_resources(Path(d)), commands)
+
+            self.assertEqual(len(commands.calls), 1)
+            self.assertEqual(commands.rules, [])
+
 
 if __name__ == "__main__":
     unittest.main()
