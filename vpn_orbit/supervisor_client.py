@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TypedDict
 
-from .probe_commands import SAFE_ENV, Commands
+from .probe_commands import SAFE_ENV, Commands, IsolationUnavailable
 from .runner_types import IsolationResources
 
 
@@ -17,6 +17,7 @@ class Reply(TypedDict):
     code: int | None
     stdout: str
     pid: int
+    error: str | None
 
 
 class SupervisorClient(Commands):
@@ -47,17 +48,27 @@ class SupervisorClient(Commands):
     def request(self, op: str, *, args: list[str] | None = None,
                 data: str | None = None, timeout_s: float = 5.0) -> Reply:
         deadline = self.resources.deadline + 15 if op in ("stop", "cleanup") else self.deadline
-        self.channel.settimeout(min(15.0, max(0.001, deadline - time.monotonic())))
-        self.channel.send(json.dumps({"op": op, "args": args, "data": data, "timeout_s": timeout_s}).encode())
-        raw = json.loads(self.channel.recv(65536))
+        try:
+            self.channel.settimeout(min(15.0, max(0.001, deadline - time.monotonic())))
+            self.channel.send(json.dumps({"op": op, "args": args, "data": data, "timeout_s": timeout_s}).encode())
+            raw = json.loads(self.channel.recv(65536))
+        except TimeoutError:
+            raise
+        except (OSError, ValueError, TypeError) as exc:
+            raise IsolationUnavailable("supervisor response unavailable") from exc
+        if not isinstance(raw, dict):
+            raise IsolationUnavailable("invalid supervisor response")
         return {"ok": raw.get("ok", False), "code": raw.get("code"),
-                "stdout": raw.get("stdout", ""), "pid": raw.get("pid", 0)}
+                "stdout": raw.get("stdout", ""), "pid": raw.get("pid", 0),
+                "error": raw.get("error")}
 
     def run(self, args: Sequence[str], *, data: str | None = None) -> subprocess.CompletedProcess[str]:
         reply = self.request("run", args=list(args), data=data)
+        if reply["error"] == "command_not_found":
+            raise FileNotFoundError("supervised command unavailable")
         code = reply["code"]
         if code is None:
-            raise RuntimeError("missing command result")
+            raise IsolationUnavailable("missing command result")
         return subprocess.CompletedProcess(args, code, reply["stdout"], "")
 
     def openssl(self, args: Sequence[str], data: bytes, timeout_s: float) -> bytes:

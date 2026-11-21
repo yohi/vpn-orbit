@@ -54,6 +54,54 @@ class LiveRunnerTests(unittest.TestCase):
         self.runner.commands = self.commands
         self.runner.resources = self.r
 
+    def test_short_lived_openvpn_error_reports_fixed_code_only(self):
+        class ExitedProcess:
+            def poll(self):
+                return 1
+
+        (self.r.private_dir / "openvpn.log").write_text(
+            "VERIFY ERROR: test certificate failure, secret=DO_NOT_PRINT"
+        )
+        result, reason = self.runner.wait_for_tun(ExitedProcess(), self.r, self.r.deadline)
+        self.assertIsNone(result)
+        self.assertEqual(reason, "tun_unavailable")
+        self.assertEqual(self.runner.openvpn_failure_code, "tls_verification_failed")
+        self.assertNotIn("DO_NOT_PRINT", self.runner.openvpn_failure_code)
+
+    def test_process_exit_and_progress_are_fixed_codes(self):
+        class Exited:
+            def poll(self):
+                return 1
+
+        (self.r.private_dir / "openvpn.log").write_text(
+            "TLS: Initial packet from 8.8.8.8; VERIFY ERROR: SECRET_NOT_TO_LOG"
+        )
+        tun, code = self.runner.wait_for_tun(Exited(), self.r, self.r.deadline)
+        self.assertIsNone(tun)
+        self.assertEqual(code, "tun_unavailable")
+        self.assertEqual(self.runner.openvpn_process_state, "exited")
+        self.assertEqual(self.runner.openvpn_progress, "tls_packet_seen")
+        self.assertEqual(self.runner.openvpn_failure_code, "tls_verification_failed")
+
+    def test_passive_link_io_observation_only_reads_veth_statistics(self):
+        report = json.dumps([{"ifname": "vn-test", "stats64": {
+            "rx": {"packets": 2}, "tx": {"packets": 3},
+        }}])
+        with patch.object(self.commands, "run",
+                          return_value=subprocess.CompletedProcess([], 0, report, "")) as run:
+            self.runner._sample_link_io(self.r)
+        self.assertEqual(self.runner.link_io, "bidirectional")
+        self.assertEqual(run.call_args.args[0], [
+            "ip", "netns", "exec", "vo-test", "ip", "-s", "-j",
+            "link", "show", "dev", "vn-test",
+        ])
+        self.assertNotIn("SECRET", self.runner.link_io)
+
+    def test_passive_link_io_failure_does_not_raise(self):
+        with patch.object(self.commands, "run", side_effect=OSError("SENSITIVE_LOG")):
+            self.runner._sample_link_io(self.r)
+        self.assertEqual(self.runner.link_io, "unavailable")
+
     def test_actual_setup_commands_confine_remote_and_drop_other_traffic(self):
         # Given a real command builder with the privileged syscall seam recorded.
         with patch("vpn_orbit.isolation.Path.write_text") as forward:
@@ -100,13 +148,29 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertNotIn("-k", args)
         self.assertNotIn("--location", args)
 
+    def test_direct_rejection_ignores_route_get_exit_but_requires_curl_refusal(self):
+        # Real kernels return 0 for `route get ... oif DEV` (assumed on-link).
+        from unittest import mock
+        def fake(curl_rc):
+            def run(args, *, data=None):
+                rc = 0 if "route" in args else curl_rc
+                return subprocess.CompletedProcess(args, rc, "", "")
+            return run
+        with mock.patch.object(self.commands, "run", side_effect=fake(28)):
+            ok, detail = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
+        self.assertTrue(ok)
+        self.assertEqual(detail, "route_exit_0;curl_exit_28")
+        with mock.patch.object(self.commands, "run", side_effect=fake(0)):
+            ok, _ = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
+        self.assertFalse(ok)
+
     def test_direct_route_rejection_uses_veth_not_host_echo(self):
         # Given the actual adapter after the tunnel is up.
         # When the bypass is tested.
         ok, detail = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
         # Then route and connection refusal are both required inside the namespace.
         self.assertTrue(ok)
-        self.assertEqual(detail, "route_exit_2;curl_exit_7")
+        self.assertEqual(detail, "route_exit_2;curl_exit_7")  # route exit is informational
         route, curl = [args for args, _ in self.commands.calls]
         self.assertEqual(route[-2:], ["oif", "vn-test"])
-        self.assertEqual(curl[curl.index("--interface") + 1], "vn-test")
+        self.assertEqual(curl[curl.index("--interface") + 1], "if!vn-test")

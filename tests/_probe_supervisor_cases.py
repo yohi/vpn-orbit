@@ -1,3 +1,4 @@
+import json
 import multiprocessing
 import os
 import select
@@ -11,7 +12,9 @@ import unittest
 from pathlib import Path
 
 from vpn_orbit.runner_types import IsolationResources
+from vpn_orbit.probe_commands import CommandUnavailable, IsolationUnavailable
 from vpn_orbit.supervisor import serve
+from vpn_orbit.supervisor_client import SupervisorClient
 
 
 def _serve_with_tools(channel, other_fd, resources, binary_dir, state):
@@ -159,6 +162,67 @@ with socket.socket(fileno=int(sys.argv[1])) as channel:
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_missing_iptables_keeps_supervisor_available_through_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binaries = _tools(root)
+            private = root / "private"
+            private.mkdir(mode=0o700)
+            resources = IsolationResources(
+                netns="vo-test", private_dir=private, veth_host="vh-test",
+                veth_ns="vn-test", remote_ip="8.8.8.8", protocol="udp", port=1195,
+            )
+            resources.deadline = time.monotonic() + 15
+            owner_channel, supervisor_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            supervisor = multiprocessing.get_context("fork").Process(
+                target=_serve_with_tools,
+                args=(supervisor_channel, owner_channel.fileno(), resources, binaries, root),
+            )
+            supervisor.start()
+            supervisor_channel.close()
+            owner_channel.settimeout(5)
+            self.assertEqual(json.loads(owner_channel.recv(65536)), {"ok": True})
+            client = SupervisorClient.__new__(SupervisorClient)
+            client.channel = owner_channel
+            client.resources = resources
+            client.deadline = resources.deadline
+
+            try:
+                with self.assertRaises(CommandUnavailable):
+                    client.checked(["iptables", "-w", "2", "-S", "FORWARD"])
+                self.assertEqual(client.checked(["ip", "-j", "link", "show"]), "[]\n")
+                self.assertTrue(client.request("cleanup")["ok"])
+                supervisor.join(timeout=5)
+                self.assertEqual(supervisor.exitcode, 0)
+                self.assertFalse(private.exists())
+            finally:
+                owner_channel.close()
+                if supervisor.is_alive():
+                    supervisor.kill()
+                    supervisor.join(timeout=2)
+
+    def test_missing_supervisor_reply_is_normalized(self):
+        client = SupervisorClient.__new__(SupervisorClient)
+        client.resources = type("Resources", (), {"deadline": time.monotonic() + 5})()
+        client.deadline = client.resources.deadline
+        client.channel = type("Channel", (), {
+            "settimeout": lambda self, timeout: None,
+            "send": lambda self, payload: None,
+            "recv": lambda self, size: b"",
+        })()
+
+        with self.assertRaises(IsolationUnavailable):
+            client.request("run")
+
+    def test_missing_command_code_is_normalized(self):
+        client = SupervisorClient.__new__(SupervisorClient)
+        client.request = lambda *args, **kwargs: {
+            "ok": True, "code": None, "stdout": "", "pid": 0, "error": None,
+        }
+
+        with self.assertRaises(IsolationUnavailable):
+            client.run(["iptables"])
+
     def test_sigkill_owner_kills_reaps_and_cleans(self):
         with tempfile.TemporaryDirectory() as directory:
             _check_supervisor_kills_reaps_and_cleans(Path(directory), "sigkill")

@@ -21,7 +21,7 @@ jobs:
       - name: Install explicit probe dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y openvpn iproute2 nftables curl openssl libc-bin
+          sudo apt-get install --no-install-recommends -y openvpn iproute2 nftables iptables curl openssl libc-bin
       - name: Run isolated feasibility probe
         env:
           IPAPI_IS_API_KEY: ${{ secrets.IPAPI_IS_API_KEY }}

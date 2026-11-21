@@ -11,6 +11,10 @@ class IsolationUnavailable(RuntimeError):
     pass
 
 
+class CommandUnavailable(IsolationUnavailable):
+    pass
+
+
 class Commands:
     def __init__(self, deadline: float) -> None:
         self.deadline = deadline
@@ -54,6 +58,8 @@ class Commands:
     def checked(self, args: Sequence[str], *, data: str | None = None) -> str:
         try:
             result = self.run(args, data=data)
+        except FileNotFoundError as exc:
+            raise CommandUnavailable("isolation command unavailable") from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise IsolationUnavailable("isolation command unavailable") from exc
         if result.returncode:

@@ -10,10 +10,12 @@ import argparse
 import ipaddress
 import json
 import os
+import socket
 from dataclasses import asdict, dataclass
 from typing import Callable, Iterable, Literal, NoReturn
 
 from .geoip import GeoDecision, lookup_geoip
+from .openvpn_diagnostics import OPENVPN_PROGRESS_CODES, PROCESS_STATES, LINK_IO_CODES
 from .openvpn_probe import ProbeResult, ProbeStatus, probe_candidates, probe_one
 from .phase1 import Candidate, convert_ovpn, fetch_catalog, parse_catalog
 
@@ -23,6 +25,7 @@ __all__ = [
     "RemoteKey",
     "ScreenedCandidate",
     "screen_candidates",
+    "tcp_reachable",
     "probe_candidates",
     "ProbeStatus",
     "ProbeResult",
@@ -84,6 +87,24 @@ def _to_ip_int(ip: str) -> int:
     return int(ipaddress.IPv4Address(ip))
 
 
+_PREFLIGHT_TIMEOUT_S = 3.0
+
+
+def tcp_reachable(key: RemoteKey, timeout_s: float = _PREFLIGHT_TIMEOUT_S) -> bool:
+    """Bounded TCP connect check; UDP cannot be verified and is never filtered out.
+
+    RemoteKey guarantees a globally routable IPv4 address. Only a connect is
+    attempted: no data is sent and no response content is read or logged.
+    """
+    if key.protocol != "tcp":
+        return True
+    try:
+        with socket.create_connection((key.ip, key.port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
 def screen_candidates(
     catalog: str,
     *,
@@ -91,6 +112,7 @@ def screen_candidates(
     geo_lookup: Callable[[str], GeoDecision],
     scan_window: int = 40,
     limit: int = 10,
+    reachable: Callable[[RemoteKey], bool] | None = None,
 ) -> list[ScreenedCandidate]:
     """Return a deterministic shortlist of screened VPN Gate candidates."""
     if scan_window != _SCAN_WINDOW:
@@ -176,10 +198,34 @@ def screen_candidates(
         )))
 
     entries.sort(key=lambda item: item[0])
-    return [entry[1] for entry in entries[:limit]]
+    if reachable is None:
+        return [entry[1] for entry in entries[:limit]]
+    # Pre-flight stays inside the fixed scan window and keeps its ranking;
+    # it is evaluated lazily and stops once `limit` reachable candidates exist.
+    selected: list[ScreenedCandidate] = []
+    for _, screened in entries:
+        if reachable(screened.remote):
+            selected.append(screened)
+            if len(selected) >= limit:
+                break
+    return selected
 
 
 # probe_candidates is re-exported from openvpn_probe.
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateDiagnostic:
+    index: int
+    status: str
+    phase: str
+    elapsed_ms: int
+    cleanup_status: str
+    reason_code: str
+    protocol: str
+    openvpn_progress: str
+    openvpn_process_state: str
+    link_io: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +236,7 @@ class ProbeSummary:
     witness_ingress: str | None = None
     witness_exit: str | None = None
     reason_codes: tuple[str, ...] = ()
+    candidate_diagnostics: tuple[CandidateDiagnostic, ...] = ()
 
 
 class _SummaryParser(argparse.ArgumentParser):
@@ -209,6 +256,25 @@ def _summarize_results(results: list[ProbeResult]) -> ProbeSummary:
         f"{witness.ingress_ip}:{witness.port}/{witness.protocol}" if witness else None,
         witness.exit_ip if witness else None,
         tuple(sorted({result.reason_code for result in results})),
+        tuple(CandidateDiagnostic(
+            index=index, status=result.status.value,
+            phase=result.phase, elapsed_ms=result.elapsed_ms,
+            cleanup_status=result.cleanup_status,
+            reason_code=result.reason_code,
+            protocol=result.protocol if result.protocol in ("tcp", "udp") else "unknown",
+            openvpn_progress=(
+                result.openvpn_progress if type(result.openvpn_progress) is str
+                and result.openvpn_progress in OPENVPN_PROGRESS_CODES else "not_observed"
+            ),
+            openvpn_process_state=(
+                result.openvpn_process_state if type(result.openvpn_process_state) is str
+                and result.openvpn_process_state in PROCESS_STATES else "not_started"
+            ),
+            link_io=(
+                result.link_io if type(result.link_io) is str
+                and result.link_io in LINK_IO_CODES else "not_observed"
+            ),
+        ) for index, result in enumerate(results, start=1)),
     )
 
 
@@ -226,6 +292,7 @@ def _run_pipeline(args: argparse.Namespace) -> ProbeSummary:
         candidates = screen_candidates(
             fetch_catalog(), existing_pins=frozenset(), geo_lookup=geo_lookup,
             scan_window=args.scan_window, limit=args.limit,
+            reachable=tcp_reachable,
         )
         results = probe_candidates(
             candidates, geo_lookup=geo_lookup, timeout_s=args.timeout_seconds,

@@ -9,6 +9,9 @@ from pathlib import Path
 
 from .isolation import ns_command, provision
 from .probe_commands import Commands
+from .openvpn_diagnostics import (
+    advance_progress, classify_link_io, observe_openvpn_log,
+)
 from .runner_types import CurlOutcome, IsolationResources, ProcessHandle
 from .supervisor_client import SupervisedProcess, SupervisorClient
 
@@ -24,6 +27,10 @@ class SubprocessRunner:
         self.resources: IsolationResources | None = None
         self.default_routes = ""
         self.cleanup_ok = False
+        self.openvpn_failure_code = "not_observed"
+        self.openvpn_progress = "not_observed"
+        self.openvpn_process_state = "not_started"
+        self.link_io = "not_observed"
 
     def prerequisites_ok(self) -> bool:
         return os.geteuid() == 0 and Path("/dev/net/tun").exists() and all(
@@ -57,18 +64,50 @@ class SubprocessRunner:
         reply = self.client.request("start")
         return SupervisedProcess(self.client, reply["pid"])
 
+    def _observe_openvpn(self, log: Path) -> None:
+        # Never publish log content; fixed codes are the only observable output.
+        failure, progress = observe_openvpn_log(log)
+        self.openvpn_failure_code = failure
+        self.openvpn_progress = advance_progress(self.openvpn_progress, progress)
+
+    def _sample_link_io(self, resources: IsolationResources) -> None:
+        # Passive *veth* counters (may include ARP); not proof of VPN peer replies.
+        try:
+            result = self.commands.run(ns_command(
+                resources, "ip", "-s", "-j", "link", "show", "dev", resources.veth_ns,
+            ))
+            self.link_io = (
+                classify_link_io(result.stdout, resources.veth_ns)
+                if result.returncode == 0 else "unavailable"
+            )
+        except Exception as exc:  # Advisory metric failure never relaxes safety checks.
+            if isinstance(exc, TimeoutError):
+                raise  # Preserve SIGALRM/ProbeDeadline fail-closed behavior.
+            self.link_io = "unavailable"
+
     def wait_for_tun(self, process: ProcessHandle, resources: IsolationResources,
                      deadline: float) -> tuple[str | None, str]:
-        while time.monotonic() < deadline and process.poll() is None:
-            log = resources.private_dir / "openvpn.log"
-            if log.exists() and "Initialization Sequence Completed" in log.read_text(errors="replace"):
+        log = resources.private_dir / "openvpn.log"
+        next_io_sample = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            code = process.poll()
+            self.openvpn_process_state = "running" if code is None else "exited"
+            self._observe_openvpn(log)
+            if code is not None:
+                break
+            if self.openvpn_progress == "initialized":
                 result = self.commands.run(ns_command(resources, "ip", "-j", "-4", "addr", "show", "dev", "tun0"))
                 if result.returncode == 0:
                     for row in json.loads(result.stdout):
                         for addr in row.get("addr_info", []):
                             if addr.get("family") == "inet":
                                 return str(ipaddress.IPv4Address(addr["local"])), "tls_established"
+            now = time.monotonic()
+            if now >= next_io_sample and deadline - now > 6.0:
+                self._sample_link_io(resources)
+                next_io_sample = now + 20.0
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        self._observe_openvpn(log)  # Catch a process that exited before first poll.
         return None, "tun_unavailable"
 
     def resolve_host(self, hostname: str, deadline: float) -> tuple[str | None, str]:
@@ -107,12 +146,15 @@ class SubprocessRunner:
 
     def host_direct_route_rejected(self, echo_ip: str, resources: IsolationResources,
                                     deadline: float) -> tuple[bool, str]:
+        # `ip route get ... oif DEV` succeeds even without a route (the kernel assumes
+        # on-link), so it is informational only. The enforced check is behavioral:
+        # a request pinned to the veth device (`if!`) must be refused or time out.
         result = self.commands.run(ns_command(resources, "ip", "-4", "route", "get", echo_ip,
                                              "oif", resources.veth_ns))
-        curl = self.commands.run(ns_command(resources, "curl", "-4", "--silent", "--interface", resources.veth_ns,
+        curl = self.commands.run(ns_command(resources, "curl", "-4", "--silent", "--interface", "if!" + resources.veth_ns,
             "--resolve", f"api.ipify.org:443:{echo_ip}", "--noproxy", "*", "--proto", _HTTPS_ONLY,
             "--connect-timeout", "1", "--max-time", "2", _ECHO_URL))
-        return result.returncode != 0 and curl.returncode in (7, 28), f"route_exit_{result.returncode};curl_exit_{curl.returncode}"
+        return curl.returncode in (7, 28), f"route_exit_{result.returncode};curl_exit_{curl.returncode}"
 
     def curl_via_tun(self, url: str, resolve: tuple[str, int, str], interface: str,
                      resources: IsolationResources, deadline: float) -> CurlOutcome:
