@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from vpn_orbit.isolation import _forward_rules, _install_forward_rules, _remove_forward_rules
-from vpn_orbit.probe_commands import Commands
+from vpn_orbit.probe_commands import Commands, IsolationUnavailable
 from vpn_orbit.runner_types import IsolationResources
 
 
@@ -80,6 +80,15 @@ class ForwardRuleTests(unittest.TestCase):
 
             self.assertEqual(len(commands.calls), 1)
             self.assertEqual(commands.rules, [])
+
+    def test_install_does_not_skip_forward_check_failures(self):
+        class FailedCheck(Commands):
+            def run(self, args, *, data=None):
+                return subprocess.CompletedProcess(args, 1, "", "")
+
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaisesRegex(IsolationUnavailable, "isolation command failed"):
+                _install_forward_rules(_resources(Path(d)), FailedCheck(time.monotonic() + 5))
 
 
 if __name__ == "__main__":

@@ -105,8 +105,12 @@ def serve(channel: socket.socket, resources: IsolationResources) -> None:
             request = json.loads(packet)
             match request["op"]:
                 case "run":
-                    result = commands.run(request["args"], data=request.get("data"))
-                    reply = {"ok": True, "code": result.returncode, "stdout": result.stdout}
+                    try:
+                        result = commands.run(request["args"], data=request.get("data"))
+                        reply = {"ok": True, "code": result.returncode, "stdout": result.stdout}
+                    except FileNotFoundError:
+                        reply = {"ok": False, "code": None, "stdout": "",
+                                 "error": "command_not_found"}
                 case "openssl":
                     try:
                         output = commands.openssl(request["args"], base64.b64decode(request["data"], validate=True),

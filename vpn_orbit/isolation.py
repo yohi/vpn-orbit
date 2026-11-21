@@ -4,7 +4,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .probe_commands import Commands, IsolationUnavailable
+from .probe_commands import CommandUnavailable, Commands
 from .runner_types import IsolationResources
 
 
@@ -36,7 +36,7 @@ def _forward_rules(r: IsolationResources) -> list[list[str]]:
 def _install_forward_rules(r: IsolationResources, commands: Commands) -> None:
     try:
         commands.checked([*_IPT, "-S", "FORWARD"])
-    except IsolationUnavailable:
+    except CommandUnavailable:
         return  # no iptables on this host: no iptables FORWARD policy to satisfy
     for rule in reversed(_forward_rules(r)):
         commands.checked([*_IPT, "-I", "FORWARD", "1", *rule])

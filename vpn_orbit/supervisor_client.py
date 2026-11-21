@@ -17,6 +17,7 @@ class Reply(TypedDict):
     code: int | None
     stdout: str
     pid: int
+    error: str | None
 
 
 class SupervisorClient(Commands):
@@ -58,10 +59,13 @@ class SupervisorClient(Commands):
         if not isinstance(raw, dict):
             raise IsolationUnavailable("invalid supervisor response")
         return {"ok": raw.get("ok", False), "code": raw.get("code"),
-                "stdout": raw.get("stdout", ""), "pid": raw.get("pid", 0)}
+                "stdout": raw.get("stdout", ""), "pid": raw.get("pid", 0),
+                "error": raw.get("error")}
 
     def run(self, args: Sequence[str], *, data: str | None = None) -> subprocess.CompletedProcess[str]:
         reply = self.request("run", args=list(args), data=data)
+        if reply["error"] == "command_not_found":
+            raise FileNotFoundError("supervised command unavailable")
         code = reply["code"]
         if code is None:
             raise IsolationUnavailable("missing command result")
