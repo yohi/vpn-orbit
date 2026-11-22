@@ -4,6 +4,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
+import warnings
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -143,6 +145,21 @@ def _fail_result(reason: str = "tun_not_established",
 
 
 class ListTests(_JournalTestCase):
+    def test_module_invocation_runs_cli(self) -> None:
+        import runpy
+
+        with patch.dict(os.environ, {"IPAPI_IS_API_KEY": "test-key"}):
+            with patch("vpn_orbit.phase1.fetch_catalog", return_value=_catalog_with_one()):
+                with patch("vpn_orbit.geoip.lookup_geoip", return_value=GeoDecision.NON_TOKYO):
+                    with patch.object(sys, "argv", ["vpn_orbit.stage1_fixed_probe", "--list"]):
+                        with patch("sys.stdout", new=io.StringIO()) as output:
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore", RuntimeWarning)
+                                with self.assertRaises(SystemExit) as raised:
+                                    runpy.run_module("vpn_orbit.stage1_fixed_probe", run_name="__main__")
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn('"candidates"', output.getvalue())
+
     def test_list_never_invokes_probe(self) -> None:
         catalog = _catalog_with_one()
         with patch("vpn_orbit.stage1_fixed_probe.probe_one") as probe:
@@ -161,6 +178,29 @@ class ListTests(_JournalTestCase):
 
 
 class ProbeIdLifecycleTests(_JournalTestCase):
+    def test_journal_preflight_errors_return_blocked_json(self) -> None:
+        catalog = _catalog_with_one()
+        cid = candidate_id(_candidate_from_catalog(catalog))
+        for method in ("inspect", "read_approval", "reserve"):
+            with self.subTest(method=method):
+                journal, _root, tmp = _make_journal()
+                self.addCleanup(tmp.cleanup)
+                _write_approval(journal, _approval(candidate_id=cid))
+                with patch.object(journal, method, side_effect=BlockingIOError("busy")):
+                    rc, payload = _run(["--probe-id", cid],
+                                       catalog=catalog, journal=journal)
+                self.assertEqual(rc, 1)
+                self.assertEqual(payload["status"], "BLOCKED")
+                self.assertEqual(payload["reason_codes"], ["preflight_blocked"])
+
+    def test_missing_api_key_returns_blocked_json(self) -> None:
+        captured = io.StringIO()
+        with patch.dict(os.environ, {"IPAPI_IS_API_KEY": ""}):
+            with patch("sys.stdout", new=captured):
+                rc = _main(["--list"], catalog=_catalog_with_one())
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(captured.getvalue())["reason_codes"], ["input_unavailable"])
+
     def test_exact_id_invokes_probe_once(self) -> None:
         catalog = _catalog_with_one()
         candidate = _candidate_from_catalog(catalog)

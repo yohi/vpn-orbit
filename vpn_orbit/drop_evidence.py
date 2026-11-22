@@ -32,7 +32,7 @@ class DropEvidenceAttempt:
             route_result = self.commands.run(ns_command(
                 resources, "ip", "-j", "-4", "route", "show", "exact", route,
             ))
-            route_rows = json.loads(route_result.stdout)
+            route_rows = json.loads(route_result.stdout) if route_result.returncode == 0 else None
             if (route_result.returncode != 0 or not isinstance(route_rows, list) or
                     len(route_rows) != 1 or not isinstance(route_rows[0], dict)):
                 reason = "drop_route_unavailable"
@@ -113,7 +113,10 @@ class DropEvidenceAttempt:
                                 route_result = self.commands.run(ns_command(
                                     resources, "ip", "-j", "-4", "route", "show", "exact", route,
                                 ))
-                                active_rows = json.loads(route_result.stdout)
+                                active_rows = (
+                                    json.loads(route_result.stdout)
+                                    if route_result.returncode == 0 else None
+                                )
                                 words = get.stdout.split()
                                 veth_route_confirmed = (
                                     get.returncode == 0 and "dev" in words and

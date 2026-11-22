@@ -2,14 +2,11 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 import os
 import re
 import subprocess
-import sys
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
 
@@ -239,12 +236,7 @@ def _project_exit_code(status: ProbeStatus, cleanup_status: str) -> int | None:
     return 1
 
 
-def _project_evidence(
-    evidence: tuple[str, ...],
-    status: ProbeStatus,
-    reason: str,
-    phase: str,
-) -> dict[str, _EvidenceState]:
+def _project_evidence(evidence: tuple[str, ...]) -> dict[str, _EvidenceState]:
     def tun_verified(m: str) -> bool:
         return m.startswith("tls_tun_established:")
 
@@ -287,14 +279,10 @@ def _project_evidence(
     }
 
 
-def _project_result(
-    result: ProbeResult,
-    attempt_id: str,
-    candidate_id: str,
-) -> JournalResult:
+def _project_result(result: ProbeResult) -> JournalResult:
     reason = _allowed_reason_code(result.reason_code)
     phase = _project_phase(result)
-    evidence = _project_evidence(result.evidence, result.status, reason, phase)
+    evidence = _project_evidence(result.evidence)
     return JournalResult(
         status=result.status,
         recovery_state="FINALIZED",
@@ -366,7 +354,10 @@ def _run_probe_id(
     if _CandidateIdRe.fullmatch(probe_id) is None:
         return _not_started("BLOCKED", ["preflight_blocked"])
 
-    snapshot = journal.inspect()
+    try:
+        snapshot = journal.inspect()
+    except (OSError, ValueError, UnicodeError):
+        return _not_started("BLOCKED", ["preflight_blocked"])
     if snapshot.has_unresolved or snapshot.has_active:
         return _not_started("BLOCKED", ["preflight_blocked"])
     if snapshot.legacy_hold:
@@ -380,54 +371,59 @@ def _run_probe_id(
     if candidate is None:
         return _not_started("NOT_VERIFIED", ["candidate_not_found"])
 
-    approval = journal.read_approval()
+    try:
+        approval = journal.read_approval()
+    except (OSError, ValueError, UnicodeError):
+        return _not_started("BLOCKED", ["preflight_blocked"])
     if approval is None:
         return _not_started("BLOCKED", ["legacy_unknown_owner_decision_required"])
     if approval.candidate_id != probe_id or approval.approved_head != head:
         return _not_started("BLOCKED", ["preflight_blocked"])
 
     try:
-        with journal.reserve(
+        handle = journal.reserve(
             candidate_id=probe_id,
             ingress=_ingress(candidate),
             head=head,
             approval=approval,
-        ) as handle:
-            try:
-                journal.mark_running(handle)
-            except OSError:
-                return _not_started(
-                    "BLOCKED",
-                    ["probe_start_blocked"],
-                    attempt_id=handle.attempt_id,
-                    candidate_id=probe_id,
-                )
-            try:
-                result = probe_one(
-                    candidate,
-                    geo_lookup=geo_lookup,
-                    runner=runner,
-                )
-            except Exception:
-                return _result_unknown(
-                    ["attempt_result_unavailable"],
-                    attempt_id=handle.attempt_id,
-                    candidate_id=probe_id,
-                    phase="not_started",
-                )
-            journal_result = _project_result(result, handle.attempt_id, probe_id)
-            try:
-                journal.complete(handle, result=journal_result)
-            except Exception:
-                return _result_unknown(
-                    ["journal_finalization_failed"],
-                    attempt_id=handle.attempt_id,
-                    candidate_id=probe_id,
-                    phase=journal_result.phase,
-                )
-            return _from_journal(journal_result, handle.attempt_id, probe_id)
-    except PermissionError:
+        )
+    except (OSError, ValueError, UnicodeError):
         return _not_started("BLOCKED", ["preflight_blocked"])
+
+    with handle:
+        try:
+            journal.mark_running(handle)
+        except OSError:
+            return _not_started(
+                "BLOCKED",
+                ["probe_start_blocked"],
+                attempt_id=handle.attempt_id,
+                candidate_id=probe_id,
+            )
+        try:
+            result = probe_one(
+                candidate,
+                geo_lookup=geo_lookup,
+                runner=runner,
+            )
+        except Exception:
+            return _result_unknown(
+                ["attempt_result_unavailable"],
+                attempt_id=handle.attempt_id,
+                candidate_id=probe_id,
+                phase="not_started",
+            )
+        journal_result = _project_result(result)
+        try:
+            journal.complete(handle, result=journal_result)
+        except Exception:
+            return _result_unknown(
+                ["journal_finalization_failed"],
+                attempt_id=handle.attempt_id,
+                candidate_id=probe_id,
+                phase=journal_result.phase,
+            )
+        return _from_journal(journal_result, handle.attempt_id, probe_id)
 
 
 def _main(
@@ -439,13 +435,18 @@ def _main(
     runner: ProbeRunner | None = None,
     head: str | None = None,
 ) -> int:
-    geo_lookup = geo_lookup or _geo_lookup_default()
     journal = journal or AttemptJournal(_journal_root())
     head = head or _current_head()
     try:
         args = _parse_args(argv)
     except ValueError:
         print(_as_json(_not_started("BLOCKED", ["preflight_blocked"])))
+        return 1
+
+    try:
+        geo_lookup = geo_lookup or _geo_lookup_default()
+    except RuntimeError:
+        print(_as_json(_not_started("BLOCKED", ["input_unavailable"])))
         return 1
 
     try:
@@ -476,3 +477,7 @@ def _main(
 
 def main(argv: list[str] | None = None) -> int:
     return _main(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

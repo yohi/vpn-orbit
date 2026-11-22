@@ -1,4 +1,5 @@
 import tempfile
+import subprocess
 import time
 import unittest
 from pathlib import Path
@@ -30,6 +31,19 @@ class DropEvidenceTests(unittest.TestCase):
         ok, marker = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
         self.assertTrue(ok)
         self.assertEqual(marker, "direct_drop_counter_verified")
+
+    def test_failed_initial_route_query_returns_route_unavailable(self):
+        original_run = self.commands.run
+
+        def fail_route_query(args, *, data=None):
+            if "route" in args and "show" in args and "-j" in args:
+                return subprocess.CompletedProcess(args, 2, "", "")
+            return original_run(args, data=data)
+
+        self.commands.run = fail_route_query
+        ok, reason = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "drop_route_unavailable")
 
     def test_curl_timeout_without_counter_increment_is_fail(self):
         self.commands.drop_counter_increment = False
