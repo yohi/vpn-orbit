@@ -281,6 +281,19 @@ class AttemptJournal:
                 case unreachable:
                     assert_never(unreachable)
             record["completed_at"] = datetime.now(UTC).isoformat()
-            self._write_record(handle._record_path, record)
+            try:
+                self._write_record(handle._record_path, record)
+            except OSError:
+                # The final rename may be visible even though its directory
+                # entry was not durably synced. Keep the attempt fail-closed.
+                record["state"] = "RESULT_UNKNOWN"
+                record["recovery_state"] = "RESULT_UNKNOWN"
+                record["status"] = None
+                record["exit_code"] = None
+                try:
+                    self._write_record(handle._record_path, record)
+                except OSError:
+                    pass
+                raise
         finally:
             handle.release()

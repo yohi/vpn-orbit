@@ -27,7 +27,6 @@ from .runner import ProbeRunner
 _EvidenceState = EvidenceState
 _CandidateIdRe: Final = re.compile(r"^[0-9a-f]{64}$")
 _JournalRoot: Final = Path("/var/lib/vpn-orbit/stage1-attempts")
-_HeadEnv: Final = "VPN_ORBIT_STAGE1_HEAD"
 _ApiKeyEnv: Final = "IPAPI_IS_API_KEY"
 
 # Fixed reason codes that may be projected from a finalized ProbeResult.
@@ -111,9 +110,6 @@ class _CliExitReason:
 
 
 def _current_head() -> str:
-    head = os.environ.get(_HeadEnv, "").strip()
-    if head:
-        return head
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],

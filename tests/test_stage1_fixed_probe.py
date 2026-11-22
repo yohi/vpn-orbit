@@ -21,7 +21,7 @@ from vpn_orbit.fixed_candidates import candidate_id
 from vpn_orbit.geoip import GeoDecision
 from vpn_orbit.phase1 import Candidate
 from vpn_orbit.probe_types import ProbeResult, ProbeStatus
-from vpn_orbit.stage1_fixed_probe import _main, main
+from vpn_orbit.stage1_fixed_probe import _current_head, _main, main
 
 
 HEAD = "head-for-tests"
@@ -111,13 +111,11 @@ def _run(argv: list[str], *, catalog: str | None = None,
          head: str = HEAD,
          geo_lookup: Callable[[str], GeoDecision] | None = None) -> tuple[int, dict]:
     captured = io.StringIO()
-    env_patch = patch.dict(os.environ, {"VPN_ORBIT_STAGE1_HEAD": head}, clear=False)
     geo = geo_lookup or (lambda _ip: GeoDecision.NON_TOKYO)
     with patch("vpn_orbit.stage1_fixed_probe.fetch_catalog", return_value=catalog):
-        with env_patch:
-            with patch("sys.stdout", new=captured):
-                rc = _main(argv, catalog=catalog, journal=journal, runner=runner,
-                           head=head, geo_lookup=geo)
+        with patch("sys.stdout", new=captured):
+            rc = _main(argv, catalog=catalog, journal=journal, runner=runner,
+                       head=head, geo_lookup=geo)
     output = captured.getvalue().strip()
     return rc, json.loads(output) if output else {}
 
@@ -145,6 +143,16 @@ def _fail_result(reason: str = "tun_not_established",
 
 
 class ListTests(_JournalTestCase):
+    def test_current_head_ignores_environment_override(self) -> None:
+        with patch.dict(os.environ, {"VPN_ORBIT_STAGE1_HEAD": "forged-head"}):
+            with patch(
+                "vpn_orbit.stage1_fixed_probe.subprocess.run",
+                return_value=type("Result", (), {"stdout": "actual-head\n"})(),
+            ) as run:
+                self.assertEqual(_current_head(), "actual-head")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], ["git", "rev-parse", "HEAD"])
+
     def test_module_invocation_runs_cli(self) -> None:
         import runpy
 

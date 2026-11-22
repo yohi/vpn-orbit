@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import stat
 import tempfile
@@ -123,8 +124,10 @@ class AttemptJournalTests(unittest.TestCase):
         self.approval_file(issued)
         handle = self.journal.reserve(candidate_id="candidate-a", ingress="1.2.3.4:443/tcp", head="head-a", approval=issued)
         self.addCleanup(handle.__exit__, None, None, None)
-        with self.assertRaises(OSError):
-            self.journal.reserve(candidate_id="candidate-b", ingress="1.2.3.5:443/tcp", head="head-a", approval=approval("candidate-b"))
+        second_approval = approval("candidate-b")
+        self.approval_file(second_approval)
+        with self.assertRaises(BlockingIOError):
+            self.journal.reserve(candidate_id="candidate-b", ingress="1.2.3.5:443/tcp", head="head-a", approval=second_approval)
         self.assertEqual(len(list(self.root.glob("attempt-*.json"))), 1)
 
     def test_reserve_rechecks_under_lock(self) -> None:
@@ -169,7 +172,15 @@ class AttemptJournalTests(unittest.TestCase):
         self.approval_file(issued)
         handle = self.journal.reserve(candidate_id="candidate-a", ingress="1.2.3.4:443/tcp", head="head-a", approval=issued)
         handle.__exit__(None, None, None)
-        second = approval("candidate-b")
+        second = OwnerApproval(
+            approval_id="approval-b",
+            issue_ref="yohi/vpn-orbit#9",
+            legacy_disposition="ACKNOWLEDGED_RESULT_UNKNOWN",
+            candidate_id="candidate-b",
+            approved_head="head-a",
+            scope="ONE_NEW_ATTEMPT",
+            approved_at="2026-11-22T00:00:00Z",
+        )
         self.approval_file(second)
         with self.assertRaises(PermissionError):
             self.journal.reserve(candidate_id="candidate-b", ingress="1.2.3.5:443/tcp", head="head-a", approval=second)
@@ -260,6 +271,26 @@ class AttemptJournalTests(unittest.TestCase):
         self.assertTrue(self.journal.inspect().has_unresolved)
         record = json.loads(next(self.root.glob("attempt-*.json")).read_text())
         self.assertEqual(record["state"], "RUNNING")
+        self.assertIsNone(record["status"])
+
+    def test_directory_fsync_failure_after_replace_leaves_attempt_unresolved(self) -> None:
+        issued = approval()
+        self.approval_file(issued)
+        handle = self.journal.reserve(candidate_id="candidate-a", ingress="1.2.3.4:443/tcp", head="head-a", approval=issued)
+        self.journal.mark_running(handle)
+        real_fsync = os.fsync
+
+        def fail_directory_fsync(fd: int) -> None:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("directory fsync failed")
+            real_fsync(fd)
+
+        with patch("vpn_orbit.attempt_journal.os.fsync", side_effect=fail_directory_fsync):
+            with self.assertRaises(OSError):
+                self.journal.complete(handle, result=result())
+        self.assertTrue(self.journal.inspect().has_unresolved)
+        record = json.loads(next(self.root.glob("attempt-*.json")).read_text())
+        self.assertEqual(record["state"], "RESULT_UNKNOWN")
         self.assertIsNone(record["status"])
 
     def test_unknown_result_remains_unresolved_after_complete(self) -> None:
