@@ -1,9 +1,9 @@
-# VPN-ORBIT — Stage 1 Pre-Live Readiness Design R0.1.2
+# VPN-ORBIT — Stage 1 Pre-Live Readiness Design R0.1.3
 
-**Status:** LIMITED_DOCUMENT_REMEDIATION / OWNER_ADOPTION_OF_R0.1.2_PENDING  
-**Prior adoption:** Human Owner approved Design R0.1; RG-VOR-010-001〜005 remain RESOLVED; R0.1.2 addresses RG-VOR-010-006 only  
+**Status:** LIMITED_DOCUMENT_REMEDIATION / OWNER_ADOPTION_OF_R0.1.3_PENDING  
+**Prior adoption:** Human Owner approved Design R0.1; RG-VOR-010-001〜005 remain RESOLVED; R0.1.3 limits RG-VOR-010-002/004 wording and measurement contract; RG-VOR-010-006 remains unchanged  
 **Repository:** `yohi/vpn-orbit`  
-**Reviewed HEAD:** `07b89a2e1d83cdc6321d359141c9bbb4826ad450`  
+**Reviewed HEAD:** `d3fe47e1ac1a14cfd40fadd9b1b7d3b29e55dbbe`  
 **Baseline:** `master@7f1ae8cab84a94cea8369e8075b4982b652f1557`  
 **Related:** [Issue #9](https://github.com/yohi/vpn-orbit/issues/9) / [PR #10](https://github.com/yohi/vpn-orbit/pull/10) / PR #8 (merged)  
 **Selected Approach:** A — master限定補強（変更なし）
@@ -37,7 +37,7 @@ Stage 1 Fixed CLI
   +-- --list: Catalog取得・候補ID表示（OpenVPNを起動しない）
   +-- --probe-id: 固定ID照合
         +-- Safety/Owner gate: Issue #9 legacy HOLD + 新規の明示Owner承認
-        +-- AttemptJournal.inspect() / reserve()（Stage 1全体の排他）
+        +-- AttemptJournal.inspect() / reserve()（固定候補CLI経由の全candidate IDで排他）
         +-- mark_running()（OpenVPN呼出前に永続化）
         +-- probe_one() [既存実装]
              +-- Supervisor / Namespace / OpenVPN / TUN
@@ -66,15 +66,20 @@ sha256(
 
 ## 5. DROP Evidence Contract — RG-VOR-010-004
 
-既存の `host_direct_route_rejected()` を限定補強する。遮断成功は、**vethへ固定したHTTPS通信のcurl終了コード7/28** と、**同じ専用nftables `counter drop` ルールのパケットカウンターが試行前後で増加**したことの両方で確認する。
+既存`route_get_via_tun0()` はecho IPv4の `/32` routeを `tun0` に設定した後に、`host_direct_route_rejected()` を呼ぶ。したがって `curl --interface if!<veth_ns>` の拒否・タイムアウトだけでは、veth送信パケットが専用DROPルールに到達した証拠にならない。実カーネルでの成立は未実証であり、Mock PASSを実測証拠としない。
 
-専用ルールはNamespace内 `output` に置き、指定echo IPv4・TCP/443・対象vethのみに限定する。同じルールを識別子で前後照合する。`ip route get ... oif` は情報として記録するだけでPASS判定に使わない。成功時のみRunnerは `(True, "direct_drop_counter_verified")` を返す。これ以外のTrue/detail組合せは `_verify_routes()` がFAILへ正規化し、`ProbeResult.evidence` に `direct_drop_counter_verified` を付与しない。
+**計測パケットと経路の限定契約（既存Runner内、後続のOwner承認付き実通信時のみ）:**
 
-**責務境界:** Runnerは、nftables取得失敗・解析失敗・識別子不一致・カウンター不増加・curl拒否不成立を `(False, <固定コード>)` に正規化する。`_verify_routes()` はRunnerからのFalse、**またはDROP検証呼出しからの `Exception`**（`TimeoutError`、デコード不良、想定外のRuntimeError等）を `ProbeStatus.FAIL` / `drop_evidence_unavailable` に変換する。`BaseException` は握り潰さない。既存 `probe_one()` の一般例外 `NOT_VERIFIED` 経路へDROP検証の例外を逃がさない。
+1. 対象echo IPv4を既存のグローバルIPv4検証値に固定し、事前に `tun0` の当該 `/32` routeが存在することを確認・記録する。別の宛先、デフォルトルート、VPNサーバーへのルートには触れない。
+2. **経路変更より先に** Namespaceの既存 `inet <resources.table> output` へ、`oifname <veth_ns> ip daddr <echo_ip> tcp dport 443 counter drop` の専用ルールを追加する。同一テーブル内のルール識別子・パケットカウンターを取得し、条件が厳密に一致することを確認できなければパケット送出禁止。既存のデフォルトDROP、VPNサーバー宛許可、TUN HTTPS許可、ホスト側の限定forward/NATを変更しない。
+3. ルール確認後に限り、Namespaceの**当該echo IPv4の `/32` routeのみ**を一時的に `via 10.253.240.1 dev <veth_ns>` へ切り替える。通常の `ip -4 route get <echo_ip>` の結果と限定 `/32` routeを確認し、veth・想定gatewayへの経路が成立しなければ送出禁止。`ip route get ... oif` 単独の成功は経路成立の根拠にしない。
+4. この状態でのみ、既存のタイムアウト付きcurl（HTTPS、`--noproxy '*'`、`--resolve api.ipify.org:443:<echo_ip>`、`--interface if!<veth_ns>`、TCP/443、単発）を**遮断計測パケット**として送出する。curl終了コード7/28に加え、**同一の専用DROPルールのパケットカウンターが送出前後で厳密に増加**したことを確認する。curlの拒否だけ、あるいは `ip route get` だけではPASSとしない。
+5. **成功・失敗・例外・タイムアウトのすべてで `finally` に復旧を試みる。** まず一時veth向け `/32` を元の `tun0` 向け `/32` routeへ復元し、通常のroute getとroute一覧で `dev tun0`、元の経路属性、veth向け一時 `/32` の不在を確認する。**復元を確認してから**専用DROPルールを識別子で撤去し、その不在を確認する。ルールは復元前に撤去しない。復旧できなければ、制限的なDROPを保持して後続の既存Supervisor/Namespace Cleanupに委ね、成功扱いせず停止する。ホストデフォルトルート不変と既存CleanupのFAIL優先も維持する。
+6. 上記の送出・カウンター・経路復元・専用ルール撤去の**全条件が確認できた場合のみ**、Runnerは `(True, "direct_drop_counter_verified")` を返し、`_verify_routes()` は固定成功マーカーを採用する。復元未確認のままTUN HTTPSへ進まない。
 
-使用する固定失敗コードは `drop_curl_not_refused`、`drop_counter_unavailable`、`drop_counter_invalid`、`drop_counter_not_advanced`、`drop_evidence_unavailable`。**どのケースも最終 `ProbeResult.status == FAIL`**。Cleanup失敗が発生した場合は従来どおり `FAIL / cleanup_failed:*` を優先する。秘密情報、生のコマンド出力、nftables JSON、OpenVPNログを理由コードに含めない。
+**FAIL正規化:** Runnerは、ルール作成・取得/解析・同一性確認・カウンター不増加・curl拒否不成立・一時経路切替/確認・tun0経路復元/確認・専用ルール撤去/確認の失敗を `(False, <固定コード>)` にする。`_verify_routes()` はFalse、予期しないTrue/detail、またはDROP検証呼出しからの `Exception`（`TimeoutError`等）を最終 `ProbeStatus.FAIL` に正規化し、既存 `probe_one()` の一般例外 `NOT_VERIFIED` 経路へ逃がさない。`BaseException` は握り潰さない。既存Cleanup失敗は `FAIL / cleanup_failed:*` を最優先とする。
 
-VPNサーバーへの許可、TUN経由HTTPS、DNS/IPv6遮断、TLS検証は緩和しない。`direct_drop_counter_verified` が無い場合、東京出口IPv4のPASSを確定しない。
+固定失敗コード: `drop_curl_not_refused`、`drop_counter_unavailable`、`drop_counter_invalid`、`drop_counter_not_advanced`、`drop_route_unavailable`、`drop_route_restore_failed`、`drop_rule_cleanup_failed`、`drop_evidence_unavailable`。どの失敗でも最終FAILとし、`direct_drop_counter_verified` を付与しない。生のコマンド出力、nftables JSON、OpenVPNログ、秘密情報をreason/evidenceへ流さない。TLS/DNS/IPv6・許可宛先の既存制限を緩和しない。
 
 ## 6. Attempt Journal Contract — RG-VOR-010-001/002
 
@@ -86,9 +91,9 @@ VPNサーバーへの許可、TUN経由HTTPS、DNS/IPv6遮断、TLS検証は緩�
 
 新しい実行を認める条件は、Human Ownerが**Issue #9の未知状態を認識した上で、新たな1試行について別途明示承認した**ことを示す、制限アクセスの `OwnerApproval` レコードだけとする。これは過去の試行をPASS/FAILへ書き換える操作ではなく、新しい単発試行の権限付与である。自動承認・`--force`・`--retry`・候補変更による回避は禁止。記録には `approval_id`, `issue_ref="yohi/vpn-orbit#9"`, `legacy_disposition="ACKNOWLEDGED_RESULT_UNKNOWN"`, `candidate_id`, `approved_head`, `scope="ONE_NEW_ATTEMPT"`, `approved_at` を必須とする。レコードはroot所有0600の既定パスに置き、RunbookにOwnerによる確認・作成・提示の手順を記載する。AIはOwnerの承認を推測・代理生成しない。承認IDは使い捨てとし、Journalで原子的に使用済みを記録する。**実行可能性は空Journalではなく、既存HOLDの認識＋当該試行への明示承認＋Journalの原子的検査によってのみ確定する。**
 
-### 6.2 全Stage 1の排他、公開契約と状態遷移
+### 6.2 固定候補CLI経由の全candidate IDの排他、公開契約と状態遷移
 
-状態ディレクトリはゲスト内の `/var/lib/vpn-orbit/stage1-attempts`（root所有0700、ファイル0600）とし、Gitリポジトリ外に置く。`fcntl.flock` は**候補IDに関係なくStage 1全体で1個のグローバルロック**を使用する。異なる候補IDを同時指定しても2件目は `BLOCKED / stage1_already_active`。所有者不正・symlink・書込み不可・ロック取得不可なら起動前にBLOCKED。
+状態ディレクトリはゲスト内の `/var/lib/vpn-orbit/stage1-attempts`（root所有0700、ファイル0600）とし、Gitリポジトリ外に置く。`fcntl.flock` は**新設の `vpn_orbit.stage1_fixed_probe --probe-id` を経由する全candidate IDで共通の1個のロック**を使用する。固定候補CLIから異なるcandidate IDを同時指定しても2件目は `BLOCKED / stage1_already_active`。これは**固定候補CLI内だけの技術的排他保証**であり、既存の `vpn_orbit.cloud_probe` はAttemptJournalを通らず `probe_candidates()` を実行するため、このロックによる排他対象外である。**既存CLIを含むStage 1全体の排他保証は主張しない。** 今回のOwner承認は既存CLIでの追加実通信を許可しない。所有者不正・symlink・書込み不可・ロック取得不可なら固定候補CLIは起動前にBLOCKED。
 
 公開契約は、`inspect() -> JournalSnapshot`（状態の読み取り、`legacy_hold` と未確定試行の有無）、`reserve(*, candidate_id, ingress, head, approval: OwnerApproval) -> AttemptHandle`、`mark_running(handle) -> None`、`complete(handle, *, result: JournalResult) -> None`、`AttemptHandle.__enter__/__exit__`（ロック保持・解放）とする。`inspect()` は参考情報であり、**`reserve()` がロック下で既存HOLD・既存未確定試行・承認IDの未使用・承認スコープ・候補/HEADを再検査**し、予約を永続化する。Task 4はこの公開契約以外に状態ファイルの内部構造へ依存しない。
 
@@ -100,7 +105,7 @@ RESERVED/RUNNING -- crash・停止・保存失敗 --> RESULT_UNKNOWN（回収時
 COMPLETED -- 次の試行 --> 自動遷移しない。新規OwnerApprovalが必要
 ```
 
-`AttemptHandle` は `reserve()` 取得時から `complete()` 終了または異常終了までロックを保持し、`finally`／context managerで解放する。プロセス死亡ならOSがロックを解放するが、**予約レコードは消えず `RESULT_UNKNOWN` を保持**する。未確定レコードを自動修復・削除しない。未確定状態は、同じ候補だけでなく**全候補への新規実行をブロック**する。Ownerが別途停止と扱いを判断するまで再試行禁止。
+`AttemptHandle` は `reserve()` 取得時から `complete()` 終了または異常終了までロックを保持し、`finally`／context managerで解放する。プロセス死亡ならOSがロックを解放するが、**予約レコードは消えず `RESULT_UNKNOWN` を保持**する。未確定レコードを自動修復・削除しない。未確定状態は、同じ候補だけでなく**固定候補CLI経由の全candidate IDへの新規実行をブロック**する。既存CLIはこの自動HOLDを技術的には参照しないため、Runbookではその実行禁止・事前不存在確認・Owner承認境界を明示する。事前確認は既存CLIとの競合が絶対に起こらない証明ではない。Ownerが別途停止と扱いを判断するまで再試行禁止。
 
 記録の永続化は原子的更新と必要な `fsync` を伴う。`mark_running()` 失敗なら `probe_one()` を呼ばない。`complete()` 失敗時は回収状態 `RESULT_UNKNOWN` とし、たとえProbeResultがPASSでもCLIは正常終了しない。Cleanup優先は既存 `probe_one()` の責務として維持する。
 
@@ -184,8 +189,8 @@ Runbookは実機検証前にIssue #9の既知結果不明試行を確認し、**
 ## 12. Authority
 
 - Design R0.1: **APPROVED**（方式Aを維持）
-- Design R0.1.2: **PENDING_OWNER_ADOPTION**（RG-VOR-010-006限定訂正版）
-- Implementation Plan R0.1.2: **PENDING_OWNER_ADOPTION**
+- Design R0.1.3: **PENDING_OWNER_ADOPTION**（RG-VOR-010-006限定訂正版）
+- Implementation Plan R0.1.3: **PENDING_OWNER_ADOPTION**
 - Implementation Authorization: **HOLD**
 - Source Code Modification / Test Execution: **HOLD**
 - GitHub Commit / Push / PR Update / Merge: **HOLD**
