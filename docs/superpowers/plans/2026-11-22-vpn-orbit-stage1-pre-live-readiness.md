@@ -1,4 +1,4 @@
-# VPN-ORBIT Stage 1 Pre-Live Readiness Implementation Plan R0.1.3
+# VPN-ORBIT Stage 1 Pre-Live Readiness Implementation Plan R0.1.4
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` or `superpowers:subagent-driven-development` only when implementation is separately authorized. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -6,9 +6,9 @@
 **Goal:** 最新masterに固定候補実行、安全な直接通信遮断証拠、実行結果回収を統合し、実機検証直前の状態を完成させる。  
 **Architecture:** 既存Cloud Probe、OpenVPN Probe、Supervisor、Isolation、Cleanupを再利用する。固定候補CLIとAttempt Journalを追加し、実通信前に候補同一性、Issue #9旧試行HOLD、新しいOwner承認、**固定候補CLI経由の全candidate IDの排他**を確定する。既存 `cloud_probe` は排他対象外。  
 **Tech Stack:** Python 3.11+、標準ライブラリ、unittest、Linux Network Namespace、nftables、OpenVPN。  
-**Spec:** [Design R0.1.3（RG-VOR-010-002/004限定訂正版・Owner採択待ち）](../specs/2026-11-22-vpn-orbit-stage1-pre-live-readiness-design.md)  
+**Spec:** [Design R0.1.4（RG-VOR-010-002限定訂正版・Owner採択待ち）](../specs/2026-11-22-vpn-orbit-stage1-pre-live-readiness-design.md)  
 **Baseline:** `master@7f1ae8cab84a94cea8369e8075b4982b652f1557`  
-**Reviewed HEAD:** `d3fe47e1ac1a14cfd40fadd9b1b7d3b29e55dbbe`  
+**Reviewed HEAD:** `e2562201e13f75b64ba124186a41a9c12bbc41c3`  
 **Related:** [Issue #9](https://github.com/yohi/vpn-orbit/issues/9) / PR #10 / PR #8 merged
 
 ## Global Constraints
@@ -169,21 +169,21 @@ class AttemptJournal:
 
 **Contract:** `/var/lib/vpn-orbit/stage1-attempts` root所有0700、各ファイル0600、symlink禁止。テストは隔離tempdirとMockでroot権限不要。`read_approval()` はOwnerの制限アクセスファイルを**読み取るだけ**。Issue #9の旧結果不明は既定HOLDであり、空Journalでも新しい単発承認がなければBLOCKED。承認内容はDesign §6.1に完全一致。AIは承認を作成・推測しない。
 
-固定候補CLIで共有する1個の `flock(LOCK_NB)` を、candidate IDに関係なく予約から完了まで保持。既存 `vpn_orbit.cloud_probe` はJournalを通らず、この技術的ロックを共有しない（Stage 1全体の排他保証ではない）。`reserve()` はOwner承認の候補ID、HEAD、Issue #9認識、承認ID未消費、他試行の `ACTIVE` / `RESULT_UNKNOWN` 不存在を**ロック下で再確認**し、承認IDを一度消費して予約をfsync。`inspect()`は参考表示であり唯一の実行許可判定にはならない。
+固定候補CLIで共有する1個の `flock(LOCK_NB)` を、candidate IDに関係なく予約から完了まで保持。**固定CLI内のロック競合は `status=BLOCKED / recovery_state=NOT_STARTED / reason_codes=["preflight_blocked"]`（予約前、`attempt_id=null`、`exit_code=null`、Probe未呼出）とする。**既存 `vpn_orbit.cloud_probe` はJournalを通らず、この技術的ロックを共有しない（Stage 1全体の排他保証ではない）。`reserve()` はOwner承認の候補ID、HEAD、Issue #9認識、承認ID未消費、他試行の `ACTIVE` / `RESULT_UNKNOWN` 不存在を**ロック下で再確認**し、承認IDを一度消費して予約をfsync。`inspect()`は参考表示であり唯一の実行許可判定にはならない。
 
 状態: `UNRESERVED → RESERVED → RUNNING → COMPLETED`。`RESERVED/RUNNING` で異常終了または記録失敗なら次回の `inspect()` は `has_unresolved=True`（`RESULT_UNKNOWN`）で全候補HOLD。プロセス終了でロックが解放されても未確定ファイルは削除しない。`mark_running()`失敗で `probe_one()` 起動禁止。`complete()`失敗ならCLIはPASS禁止。`AttemptHandle.__exit__` は正常・異常どちらもロック解放。
 
 - [ ] Step 1: `test_empty_journal_still_blocks_issue9_legacy_unknown_without_owner_approval`、`test_read_approval_rejects_wrong_issue_or_scope`、`test_approval_is_one_time_and_candidate_head_scoped` を書く。
 - [ ] Step 2: `python3 -m unittest tests.test_stage1_attempt_journal -v` でRED確認。
 - [ ] Step 3: 既定legacy HOLD、OwnerApproval読込と権限検査、`inspect()`を実装。
-- [ ] Step 4: `test_global_lock_blocks_different_candidate_ids`、`test_reserve_rechecks_under_lock`、`test_duplicate_approval_id_is_blocked`、`test_wrong_head_is_blocked`、`test_reserve_writes_restricted_durable_record` を追加しRED確認。
-- [ ] Step 5: 予約・承認ID消費・原子的保存・グローバルロックを実装。
+- [ ] Step 4: `test_global_lock_blocks_different_candidate_ids`（異なるcandidate IDの競合時に `reserve()` を拒否し、追加予約を作成しないことをassert。CLI公開コードはTask 4で検証）、`test_reserve_rechecks_under_lock`、`test_duplicate_approval_id_is_blocked`、`test_wrong_head_is_blocked`、`test_reserve_writes_restricted_durable_record` を追加しRED確認。
+- [ ] Step 5: 予約・承認ID消費・原子的保存・固定候補CLI共通ロックを実装。
 - [ ] Step 6: `test_reserved_or_running_after_crash_is_result_unknown`、`test_unresolved_blocks_all_candidates`、`test_mark_running_failure_prevents_probe`、`test_symlink_or_wrong_owner_is_blocked`、`test_unwritable_store_is_blocked` を追加しRED確認。
 - [ ] Step 7: 状態遷移、未確定HOLD、`AttemptHandle` ロック解放を最小実装。
 - [ ] Step 8: `test_complete_failure_leaves_unknown_and_never_reports_pass`、`test_null_exit_code_for_unknown`、`test_secret_values_are_not_serialized` をRED→GREENにする。
 - [ ] Step 9: 同テストモジュールを再実行し全PASS確認。
 
-**Acceptance:** Task 4は公開 `inspect/read_approval/reserve/mark_running/complete/AttemptHandle` のみで動作。空Journal、過去未回収、**固定候補CLI経由の別candidate ID並列**、未確定、記録失敗から無断OpenVPNへ到達しない。既存CLIへの適用は保証しない。
+**Acceptance:** Task 4は公開 `inspect/read_approval/reserve/mark_running/complete/AttemptHandle` のみで動作。空Journal、過去未回収、**固定候補CLI経由の別candidate ID並列**、未確定、記録失敗から無断OpenVPNへ到達しない。ロック競合のCLI公開reason codeは `preflight_blocked` のみ。既存CLIへの適用は保証しない。
 
 ### Task 4: 固定候補CLI・結果投影・回収 — RG-VOR-010-001/002/003/006
 
@@ -249,12 +249,12 @@ def main(argv: list[str] | None = None) -> int: ...
 - [ ] Step 2: `python3 -m unittest tests.test_stage1_fixed_probe -v` でREDを確認。
 - [ ] Step 3: `main(argv)`、候補ID照合、Journal公開API、`probe_one()`単発呼出、結果投影、JSON出力を実装。
 - [ ] Step 4: `test_issue9_unknown_blocks_empty_journal_without_owner_decision`、`test_issue9_unknown_blocks_different_candidate_without_owner_decision`、`test_owner_approval_must_reference_issue9_and_new_single_attempt`、`test_used_approval_cannot_relaunch`、`test_existing_unknown_attempt_blocks_probe`、`test_pre_reservation_rejection_is_not_started`、`test_legacy_unknown_does_not_become_new_attempt_unknown` を追加してRED→GREEN。
-- [ ] Step 5: `test_parallel_different_candidate_is_blocked`、`test_mark_running_failure_never_calls_probe`、`test_no_probe_invocation_after_reservation_reports_not_started`、`test_journal_complete_failure_never_reports_pass`、`test_cleanup_failure_overrides_pass` をRED→GREEN。
+- [ ] Step 5: `test_parallel_different_candidate_is_blocked`（`status=BLOCKED, recovery_state=NOT_STARTED, reason_codes=["preflight_blocked"], attempt_id=null, exit_code=null`、Probe呼出0回をassert）、`test_mark_running_failure_never_calls_probe`、`test_no_probe_invocation_after_reservation_reports_not_started`、`test_journal_complete_failure_never_reports_pass`、`test_cleanup_failure_overrides_pass` をRED→GREEN。
 - [ ] Step 6: `test_exit_code_is_nullable_and_cli_not_openvpn`、`test_tun_drop_https_tokyo_evidence_projection`、`test_drop_unverified_is_not_verified`、`test_unreached_is_not_observed`、`test_result_unknown_has_null_exit_code`、`test_started_attempt_without_result_is_unknown`、`test_journal_finalization_failure_never_reports_success`、`test_json_redacts_secrets_and_raw_profile`、`test_untrusted_errors_emit_fixed_codes_only` をRED→GREEN。
 - [ ] Step 7: `python3 -m unittest tests.test_stage1_fixed_probe -v` でGREEN確認。
 - [ ] Step 8: `python3 -m unittest tests.test_stage1_fixed_candidates tests.test_stage1_attempt_journal tests.test_stage1_fixed_probe tests.test_openvpn_probe -v` でTask 1〜4をまとめて回帰確認。
 
-**Acceptance:** Issue #9既存未回収試行、空Journal、候補変更、Owner承認再利用、別候補並列のいずれでも無断OpenVPN起動なし。全JSON/Journalフィールドの取得元・型・未取得値が確定。失敗や保存不能でPASSを報告しない。
+**Acceptance:** Issue #9既存未回収試行、空Journal、候補変更、Owner承認再利用、固定候補CLI経由の別candidate ID並列のいずれでも無断OpenVPN起動なし。全JSON/Journalフィールドの取得元・型・未取得値が確定。失敗や保存不能でPASSを報告しない。
 
 ### Task 5: オフライン受入と実機検証Runbook — RG-VOR-010-001
 
@@ -290,9 +290,9 @@ def main(argv: list[str] | None = None) -> int: ...
 
 ## Stop Conditions and Authority
 
-- HEAD・環境不一致、Namespace/OpenVPN等の不明残存、候補ID不一致、APIキー取扱不明、**Issue #9旧試行に対する新規Owner判断欠落**、空Journalを根拠とする実行、承認ID再利用、別候補並列、未確定試行、Journal書込み失敗、DROP証拠欠落、Cleanup異常はFail-Closed。
+- HEAD・環境不一致、Namespace/OpenVPN等の不明残存、候補ID不一致、APIキー取扱不明、**Issue #9旧試行に対する新規Owner判断欠落**、空Journalを根拠とする実行、承認ID再利用、固定候補CLI経由の別candidate ID並列、未確定試行、Journal書込み失敗、DROP証拠欠落、Cleanup異常はFail-Closed。
 - Design R0.1: APPROVED（方式A維持）
-- Design R0.1.3 / Plan R0.1.3: PENDING_OWNER_ADOPTION
+- Design R0.1.4 / Plan R0.1.4: PENDING_OWNER_ADOPTION
 - Implementation / Source Changes / Test Execution: HOLD
 - GitHub Commit / Push / PR Update / Merge: HOLD
 - KVM / GitHub Actions Live: HOLD
