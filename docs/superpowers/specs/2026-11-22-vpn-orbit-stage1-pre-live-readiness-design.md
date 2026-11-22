@@ -1,9 +1,9 @@
-# VPN-ORBIT — Stage 1 Pre-Live Readiness Design R0.1.4
+# VPN-ORBIT — Stage 1 Pre-Live Readiness Design R0.1.5
 
-**Status:** LIMITED_DOCUMENT_REMEDIATION / OWNER_ADOPTION_OF_R0.1.4_PENDING  
-**Prior adoption:** Human Owner approved Design R0.1; RG-VOR-010-001〜005 remain RESOLVED; R0.1.4 is a limited RG-VOR-010-002 reason-code and lock-scope clarification; prior DROP, CLI/Journal and OwnerApproval contracts are unchanged  
+**Status:** LIMITED_DOCUMENT_REMEDIATION / OWNER_ADOPTION_OF_R0.1.5_PENDING  
+**Prior adoption:** Human Owner approved Design R0.1; RG-VOR-010-001〜005 remain RESOLVED; R0.1.5 addresses the four inline documentation findings; OwnerApproval, fixed CLI lock scope, DROP and Cleanup FAIL precedence remain unchanged  
 **Repository:** `yohi/vpn-orbit`  
-**Reviewed HEAD:** `e2562201e13f75b64ba124186a41a9c12bbc41c3`  
+**Reviewed HEAD:** `d23536a396f2d8098e7e6bd4d5f06a3e9657d238`  
 **Baseline:** `master@7f1ae8cab84a94cea8369e8075b4982b652f1557`  
 **Related:** [Issue #9](https://github.com/yohi/vpn-orbit/issues/9) / [PR #10](https://github.com/yohi/vpn-orbit/pull/10) / PR #8 (merged)  
 **Selected Approach:** A — master限定補強（変更なし）
@@ -51,16 +51,22 @@ Stage 1 Fixed CLI
 - `python3 -m vpn_orbit.stage1_fixed_probe --list`
 - `python3 -m vpn_orbit.stage1_fixed_probe --probe-id <ID>`
 
-両モードは排他的。候補IDは既存補助スクリプトとの互換性を維持する。
+両モードは排他的。固定候補IDはBase64デコード直後の**元OpenVPNプロファイルのバイト列**を使う。既存のBOMなしUTF-8プロファイルのIDは従来と同一だが、先頭UTF-8 BOM (`EF BB BF`) の追加・削除は別IDとなる。
 
 ```python
 sha256(
     f"{ip}:{port}/{protocol}\n".encode("ascii")
-    + profile.encode("utf-8")
+    + profile_raw_bytes  # Base64 decode後の無変更バイト列
 ).hexdigest()
 ```
 
-`--probe-id` はCatalogを再取得し、既存のStage 1選別条件に従い指定IDを完全照合する。ID不一致・候補消失・プロファイル変更なら `NOT_VERIFIED`、OpenVPN起動禁止。重複ID・識別不整合なら `BLOCKED`。別候補への切替／フォールバックは禁止。
+**取得・互換性:** 既存 `vpn_orbit.phase1.parse_catalog()` は `raw = base64.b64decode(encoded, validate=True)` 後に `raw.decode("utf-8-sig")` するため、現在の `Candidate.profile: str` だけではBOMを復元できない。将来の別途承認済み実装では `Candidate` に省略可能な末尾フィールド `profile_raw_bytes: bytes | None = None` を追加し、`parse_catalog()` で元 `raw` を保持する。`Candidate.profile` と既存 `convert_ovpn()`、`screen_candidates()` の解析・選別・並び順は変更しない。`ScreenedCandidate.candidate` が元バイト列をそのまま固定CLIへ渡す。既存サイズ上限とUTF-8妥当性検査も維持する。
+
+`candidate_id(candidate: ScreenedCandidate) -> str` は `profile_raw_bytes` が存在し、`raw.decode("utf-8-sig") == candidate.candidate.profile` を確認できた場合のみ元バイト列をハッシュする。バイト列欠落・不整合なら `BLOCKED / NOT_STARTED / candidate_identity_unavailable`、OpenVPN呼出0回。`profile.encode("utf-8")` への黙示フォールバックは禁止。元の生バイト列をJournal・JSON・生ログに保存しない。
+
+**旧ID:** BOMなしの既存IDは維持する。BOMありプロファイルで旧方式の正規化後IDは**別名として受け入れない**。新 `--list` は元バイト列検証済み候補のIDだけを表示し、旧ID不一致は `NOT_VERIFIED / NOT_STARTED / candidate_not_found`。Issue #9の旧IDは履歴として保持し、LEGACY_RESULT_UNKNOWNやOwnerApprovalは自動解除・流用しない。Ownerの新規単発承認は現行candidate IDとHEADに完全一致させる。
+
+`--probe-id` はCatalogを再取得し、元バイト列のある候補を既存のStage 1選別条件に従って指定IDと完全照合する。元プロファイルが1byteでも変われば別IDであり、旧IDで起動しない。ID不一致・候補消失・プロファイル変更なら `NOT_VERIFIED`、OpenVPN起動禁止。重複ID・識別不整合なら `BLOCKED`。別候補への切替／フォールバックは禁止。
 
 固定候補モードではTCP事前疎通確認を行わない。既存 `screen_candidates()` に `existing_pins=frozenset(), scan_window=40, limit=10, reachable=None` を明示的に渡し、内部の固定IP除外条件を維持する。Catalog／GeoIP照会と隔離下のVPN実通信を区別する。
 
@@ -123,16 +129,20 @@ COMPLETED -- 次の試行 --> 自動遷移しない。新規OwnerApprovalが必�
 
 ### 7.2 ProbeResult → Journal/JSON投影規則
 
-既存 `ProbeResult` (`status`, `reason_code`, `evidence`, `phase`, `exit_ip`, `cleanup_status`) から以下に従い投影する。`evidence` は既知の固定マーカー**のみ**を解釈し、生ログ・生のエラー文言・未検証の値をそのままJSONへ転送しない。改修時に `tunnel_https_verified` をHTTPS成功確認直後の固定マーカーとして追加する。
+既存 `ProbeResult` (`status`, `reason_code`, `evidence`, `phase`, `exit_ip`, `cleanup_status`) から以下に従い投影する。生ログ・例外本文を使わず固定マーカーのみを解釈し、`tunnel_https_verified` はHTTPS成功確認直後の固定マーカーとして追加する。
+
+**Cleanup前の失敗帰属:** 将来の実装では `probe_one()` の `finally` 内で `cleanup()` を呼ぶ**直前**に、失敗・未検証の確定済み `state.phase` と `reason` を固定allowlistで照合し、`pre_cleanup_failure:<fixed_phase>:<fixed_reason>` を `state.evidence` に保存する。許可済みphase/reasonの組合せ以外は `stage_failure_unclassified` として扱い、失敗した段階や証拠を推測しない。Cleanup前PASSなら失敗マーカーは付けない。既存の `ProbeResult` スキーマを変更せず、成功マーカーと共存させる。
+
+Cleanupが失敗しても最終 `ProbeResult.status=FAIL`、`reason_code=cleanup_failed:*`、`phase=cleanup`、`cleanup_status=failed` の優先順位を維持する。一方、**Journal/CLIへ投影する段階別証拠とJournal `phase` は、保存済み失敗マーカーの固定phase/reasonを優先**し、Cleanupで上書きされた `reason_code`・`final_phase` から逆算しない。失敗マーカーがない場合のみ許可済み `ProbeResult.phase` を採用する。Cleanup単独失敗では架空のステージ失敗を生成しない。
 
 | Field | VERIFIEDの根拠 | FAILEDの根拠 | その他・未観測 |
 |---|---|---|---|
-| `tun_evidence` | `tls_tun_established:` マーカー（既存 `wait_for_tun()` 成功後、IPv4形式確認済み） | `reason_code` が `tun_not_established` / `tun_ip_invalid` | `NOT_OBSERVED` |
-| `drop_evidence` | 新規固定マーカー `direct_drop_counter_verified`（curl拒否＋専用DROPカウンター増加の双方検証済み） | DROP専用失敗コード `drop_*` または `host_direct_echo_route:*` | `NOT_OBSERVED` |
-| `tunnel_https_evidence` | 新規固定マーカー `tunnel_https_verified`（TLS検証付きHTTPS応答200とグローバルIPv4本文が妥当） | `exit_ip_fetch_failed` / `exit_ip_body_not_global_ipv4` | `NOT_OBSERVED` |
-| `tokyo_geoip_evidence` | `status=PASS` かつ `reason_code=exit_ip_tokyo_verified` | `reason_code=exit_ip_non_tokyo` | `NOT_OBSERVED`（GeoIP照会不能等） |
+| `tun_evidence` | `tls_tun_established:` マーカー（既存 `wait_for_tun()` 成功後、IPv4形式確認済み） | `pre_cleanup_failure:tun_wait:tun_not_established` / `pre_cleanup_failure:tun_wait:tun_ip_invalid` | `NOT_OBSERVED` |
+| `drop_evidence` | 固定マーカー `direct_drop_counter_verified`（curl拒否・専用DROPカウンター増加・経路復元確認済み） | 許可済み `pre_cleanup_failure:route_verification:drop_*` または同phaseの固定 `host_direct_echo_route:*` | `NOT_OBSERVED` |
+| `tunnel_https_evidence` | 固定マーカー `tunnel_https_verified`（TLS検証付きHTTPS応答200とグローバルIPv4本文が妥当） | `pre_cleanup_failure:tunnel_echo:exit_ip_fetch_failed` / `pre_cleanup_failure:tunnel_echo:exit_ip_body_not_global_ipv4` | `NOT_OBSERVED` |
+| `tokyo_geoip_evidence` | Cleanup前に `exit_ip_tokyo_verified` を確認し、既存PASS条件を満たす | `pre_cleanup_failure:exit_geoip:exit_ip_non_tokyo` | `NOT_OBSERVED`（GeoIP照会不能等） |
 
-`cleanup_status` は既存の値のみを採用し、`failed` は必ず最終FAIL。段階的な検証の途中で失敗したからといって、未到達の後続証拠をFAILEDにしない。`ProbeResult`に存在しないOpenVPNプロセスexit codeは取得元として使用しない。`reason_codes` は固定コードallowlistからのみ生成する。
+`cleanup_status` は既存の値のみを採用し、`failed` は必ず最終FAIL。段階別証拠はCleanup前の許可済みマーカーに帰属させ、未到達の後続証拠はFAILEDにせずNOT_OBSERVEDとする。許可されないphase/reasonや `stage_failure_unclassified` から失敗を推測しない。`ProbeResult`に存在しないOpenVPNプロセスexit codeは取得元に使わず、`reason_codes` は最終Cleanup失敗優先・固定allowlistのみで生成する。
 
 JournalとCLIのJSONは `attempt_id` で照合できる（予約前のCLI拒否では `attempt_id=null`）。**予約済み**の結果が回収不能な場合に限り、その未確定レコードを `RESULT_UNKNOWN` として扱う。JSONへの投影失敗、Journal確定失敗はPASS出力禁止。
 
@@ -162,13 +172,14 @@ JournalとCLIのJSONは `attempt_id` で照合できる（予約前のCLI拒否�
 
 - `vpn_orbit/live_runner.py`
 - `vpn_orbit/openvpn_probe.py`
+- `vpn_orbit/phase1.py`（元Profileバイト保持のみ）
 - `vpn_orbit/isolation.py`
 - `vpn_orbit/runner_types.py`（必要な契約変更のみ）
 - 固定候補CLI・Journal用の小さな新規モジュール
 - 対応するオフラインテスト
 - 実機検証用Runbook
 
-変更ファイルは最小化する。変更しない範囲：VPN Gate CSV Phase 1、既存通常候補探索CLI、Supervisorの資格情報隔離、Cleanup優先順位、iOS/sing-box連携、GitHub Actionsの自動実通信設定。OpenVPN認証原因の追加診断は本スコープ外。
+変更ファイルは最小化する。変更しない範囲：VPN Gate CSV Phase 1の既存解析・選別挙動（元バイト列保持のみ例外）、既存通常候補探索CLI、Supervisorの資格情報隔離、Cleanup優先順位、iOS/sing-box連携、GitHub Actionsの自動実通信設定。OpenVPN認証原因の追加診断は本スコープ外。
 
 ## 9. Offline Acceptance
 
@@ -189,11 +200,11 @@ Runbookは実機検証前にIssue #9の既知結果不明試行を確認し、**
 ## 12. Authority
 
 - Design R0.1: **APPROVED**（方式Aを維持）
-- Design R0.1.4: **PENDING_OWNER_ADOPTION**（RG-VOR-010-002限定訂正版）
-- Implementation Plan R0.1.4: **PENDING_OWNER_ADOPTION**
+- Design R0.1.5: **PENDING_OWNER_ADOPTION**（inline指摘4件の文書限定訂正版）
+- Implementation Plan R0.1.5: **PENDING_OWNER_ADOPTION**
 - Implementation Authorization: **HOLD**
 - Source Code Modification / Test Execution: **HOLD**
 - GitHub Commit / Push / PR Update / Merge: **HOLD**
 - Live Execution (KVM / GitHub Actions): **HOLD**
 
-この限定訂正はチャット内・ローカル成果物作成に留め、GitHubへの反映や後続Taskを自動開始しない。
+今回のOwner承認は文書2件のCommit/Pushのみ。実装、テスト、実通信、Merge、後続Taskは未承認のまま。
