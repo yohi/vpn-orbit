@@ -12,6 +12,7 @@ from .probe_commands import Commands
 from .openvpn_diagnostics import (
     advance_progress, classify_link_io, observe_openvpn_log,
 )
+from .drop_evidence import DropEvidenceAttempt
 from .runner_types import CurlOutcome, IsolationResources, ProcessHandle
 from .supervisor_client import SupervisedProcess, SupervisorClient
 
@@ -146,15 +147,7 @@ class SubprocessRunner:
 
     def host_direct_route_rejected(self, echo_ip: str, resources: IsolationResources,
                                     deadline: float) -> tuple[bool, str]:
-        # `ip route get ... oif DEV` succeeds even without a route (the kernel assumes
-        # on-link), so it is informational only. The enforced check is behavioral:
-        # a request pinned to the veth device (`if!`) must be refused or time out.
-        result = self.commands.run(ns_command(resources, "ip", "-4", "route", "get", echo_ip,
-                                             "oif", resources.veth_ns))
-        curl = self.commands.run(ns_command(resources, "curl", "-4", "--silent", "--interface", "if!" + resources.veth_ns,
-            "--resolve", f"api.ipify.org:443:{echo_ip}", "--noproxy", "*", "--proto", _HTTPS_ONLY,
-            "--connect-timeout", "1", "--max-time", "2", _ECHO_URL))
-        return curl.returncode in (7, 28), f"route_exit_{result.returncode};curl_exit_{curl.returncode}"
+        return DropEvidenceAttempt(self.commands, resources, echo_ip).execute()
 
     def curl_via_tun(self, url: str, resolve: tuple[str, int, str], interface: str,
                      resources: IsolationResources, deadline: float) -> CurlOutcome:
