@@ -1,9 +1,9 @@
-# VPN-ORBIT — Stage 1 Pre-Live Readiness Design R0.1.3
+# VPN-ORBIT — Stage 1 Pre-Live Readiness Design R0.1.4
 
-**Status:** LIMITED_DOCUMENT_REMEDIATION / OWNER_ADOPTION_OF_R0.1.3_PENDING  
-**Prior adoption:** Human Owner approved Design R0.1; RG-VOR-010-001〜005 remain RESOLVED; R0.1.3 limits RG-VOR-010-002/004 wording and measurement contract; RG-VOR-010-006 remains unchanged  
+**Status:** LIMITED_DOCUMENT_REMEDIATION / OWNER_ADOPTION_OF_R0.1.4_PENDING  
+**Prior adoption:** Human Owner approved Design R0.1; RG-VOR-010-001〜005 remain RESOLVED; R0.1.4 is a limited RG-VOR-010-002 reason-code and lock-scope clarification; prior DROP, CLI/Journal and OwnerApproval contracts are unchanged  
 **Repository:** `yohi/vpn-orbit`  
-**Reviewed HEAD:** `d3fe47e1ac1a14cfd40fadd9b1b7d3b29e55dbbe`  
+**Reviewed HEAD:** `e2562201e13f75b64ba124186a41a9c12bbc41c3`  
 **Baseline:** `master@7f1ae8cab84a94cea8369e8075b4982b652f1557`  
 **Related:** [Issue #9](https://github.com/yohi/vpn-orbit/issues/9) / [PR #10](https://github.com/yohi/vpn-orbit/pull/10) / PR #8 (merged)  
 **Selected Approach:** A — master限定補強（変更なし）
@@ -93,7 +93,7 @@ sha256(
 
 ### 6.2 固定候補CLI経由の全candidate IDの排他、公開契約と状態遷移
 
-状態ディレクトリはゲスト内の `/var/lib/vpn-orbit/stage1-attempts`（root所有0700、ファイル0600）とし、Gitリポジトリ外に置く。`fcntl.flock` は**新設の `vpn_orbit.stage1_fixed_probe --probe-id` を経由する全candidate IDで共通の1個のロック**を使用する。固定候補CLIから異なるcandidate IDを同時指定しても2件目は `BLOCKED / stage1_already_active`。これは**固定候補CLI内だけの技術的排他保証**であり、既存の `vpn_orbit.cloud_probe` はAttemptJournalを通らず `probe_candidates()` を実行するため、このロックによる排他対象外である。**既存CLIを含むStage 1全体の排他保証は主張しない。** 今回のOwner承認は既存CLIでの追加実通信を許可しない。所有者不正・symlink・書込み不可・ロック取得不可なら固定候補CLIは起動前にBLOCKED。
+状態ディレクトリはゲスト内の `/var/lib/vpn-orbit/stage1-attempts`（root所有0700、ファイル0600）とし、Gitリポジトリ外に置く。`fcntl.flock` は**新設の `vpn_orbit.stage1_fixed_probe --probe-id` を経由する全candidate IDで共通の1個のロック**を使用する。固定候補CLIから異なるcandidate IDを同時指定しても2件目はCLI応答 `status=BLOCKED / recovery_state=NOT_STARTED / reason_codes=["preflight_blocked"]` とし、Design §7.3のロック取得不可の行に一致させる。予約前の拒否なので `attempt_id=null`、`exit_code=null`、`probe_one()` 未呼出とする。これは**固定候補CLI内だけの技術的排他保証**であり、既存の `vpn_orbit.cloud_probe` はAttemptJournalを通らず `probe_candidates()` を実行するため、このロックによる排他対象外である。**既存CLIを含むStage 1全体の排他保証は主張しない。** 今回のOwner承認は既存CLIでの追加実通信を許可しない。所有者不正・symlink・書込み不可・ロック取得不可なら固定候補CLIは起動前にBLOCKED。
 
 公開契約は、`inspect() -> JournalSnapshot`（状態の読み取り、`legacy_hold` と未確定試行の有無）、`reserve(*, candidate_id, ingress, head, approval: OwnerApproval) -> AttemptHandle`、`mark_running(handle) -> None`、`complete(handle, *, result: JournalResult) -> None`、`AttemptHandle.__enter__/__exit__`（ロック保持・解放）とする。`inspect()` は参考情報であり、**`reserve()` がロック下で既存HOLD・既存未確定試行・承認IDの未使用・承認スコープ・候補/HEADを再検査**し、予約を永続化する。Task 4はこの公開契約以外に状態ファイルの内部構造へ依存しない。
 
@@ -154,7 +154,7 @@ JournalとCLIのJSONは `attempt_id` で照合できる（予約前のCLI拒否�
 - **開始判定:** `NOT_STARTED` は、今回 `probe_one()` が未呼出であると確実に断定できる場合に限る。`mark_running()` 永続化後のクラッシュ等、呼出の有無を確証できない場合は保守的に `RESULT_UNKNOWN` として新規実行を止める。予約済みレコードが未確定なら、CLIが `NOT_STARTED` を返した場合もJournalの全候補HOLDを解除しない。
 - **未開始・未回収の値:** 予約前の拒否は `attempt_id=null`、予約後に未開始と確認できる場合は当該 `AttemptHandle.attempt_id`。いずれも `exit_code=null`、`phase="not_started"`、証拠4項目は `NOT_OBSERVED`、Probe未実行につき `cleanup_status="not_required"`（ProbeのCleanupが実行されたという主張ではない）。`RESULT_UNKNOWN` でも `exit_code=null` とし、観測済みの安全な固定コード以外を推測で追加しない。
 - **終了値:** `FINALIZED` の場合だけ、既存§7.1の条件に従い `exit_code=0|1`（当該CLIの**予定**終了コード）を付ける。事前拒否時にOSが返す非0のシェル終了コードとは別の意味であり、その値をJSON `exit_code` に転用しない。
-- **安全性:** 上表の `reason_codes` は固定allowlistのみ使用し、生ログ・例外本文・OpenVPNプロファイルを出力しない。Journal確定失敗や帰属不明時に `PASS`、`FINALIZED` または新しい試行の成功・失敗を作り出さない。既存のCleanup FAIL優先、Issue #9の既定HOLD、全体排他は維持する。
+- **安全性:** 上表の `reason_codes` は固定allowlistのみ使用し、生ログ・例外本文・OpenVPNプロファイルを出力しない。Journal確定失敗や帰属不明時に `PASS`、`FINALIZED` または新しい試行の成功・失敗を作り出さない。既存のCleanup FAIL優先、Issue #9の既定HOLD、**固定候補CLI経由の全candidate IDに対する排他**を維持する。既存 `cloud_probe` との技術的相互排他は保証しない。
 
 ## 8. Scope Boundaries
 
@@ -172,7 +172,7 @@ JournalとCLIのJSONは `attempt_id` で照合できる（予約前のCLI拒否�
 
 ## 9. Offline Acceptance
 
-実装はSuperpowers TDDで行う。固定ID一致/不一致/候補変更、最大1候補、認証情報欠落、Stage 1グローバルロック、Issue #9 legacy HOLD、空Journalからの実行禁止、OwnerApproval1回消費、未確定予約、異常終了、書込み不能、DROP例外の最終FAIL、ProbeResultの固定コード投影、Cleanup失敗優先、秘密情報非露出、既存回帰を必須テストとする。
+実装はSuperpowers TDDで行う。固定ID一致/不一致/候補変更、最大1候補、認証情報欠落、固定候補CLI経由の全candidate IDに対する排他（競合時 `BLOCKED / NOT_STARTED / preflight_blocked`）、Issue #9 legacy HOLD、空Journalからの実行禁止、OwnerApproval1回消費、未確定予約、異常終了、書込み不能、DROP例外の最終FAIL、ProbeResultの固定コード投影、Cleanup失敗優先、秘密情報非露出、既存回帰を必須テストとする。
 
 MockテストPASSは実LinuxカーネルのDROP証拠や東京出口IPv4の実証を意味しない。
 
@@ -189,8 +189,8 @@ Runbookは実機検証前にIssue #9の既知結果不明試行を確認し、**
 ## 12. Authority
 
 - Design R0.1: **APPROVED**（方式Aを維持）
-- Design R0.1.3: **PENDING_OWNER_ADOPTION**（RG-VOR-010-006限定訂正版）
-- Implementation Plan R0.1.3: **PENDING_OWNER_ADOPTION**
+- Design R0.1.4: **PENDING_OWNER_ADOPTION**（RG-VOR-010-002限定訂正版）
+- Implementation Plan R0.1.4: **PENDING_OWNER_ADOPTION**
 - Implementation Authorization: **HOLD**
 - Source Code Modification / Test Execution: **HOLD**
 - GitHub Commit / Push / PR Update / Merge: **HOLD**
