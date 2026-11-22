@@ -222,6 +222,21 @@ class ProbeIdLifecycleTests(_JournalTestCase):
         self.assertEqual(payload["status"], "BLOCKED")
         self.assertEqual(payload["recovery_state"], "NOT_STARTED")
 
+    def test_issue9_unknown_blocks_different_candidate_without_owner_decision(self) -> None:
+        catalog = _catalog_with_one()
+        cid = candidate_id(_candidate_from_catalog(catalog))
+        journal, _root, _tmp = _make_journal()
+        _write_approval(journal, _approval(candidate_id="different-candidate"))
+        with patch("vpn_orbit.stage1_fixed_probe.probe_one") as probe:
+            rc, payload = _run(["--probe-id", cid], catalog=catalog, journal=journal)
+        self.assertFalse(probe.called)
+        self.assertEqual(payload["status"], "BLOCKED")
+        self.assertEqual(payload["recovery_state"], "NOT_STARTED")
+        self.assertEqual(payload["reason_codes"], ["preflight_blocked"])
+        self.assertIsNone(payload["attempt_id"])
+        self.assertIsNone(payload["exit_code"])
+        self.assertEqual(rc, 1)
+
     def test_used_approval_cannot_relaunch(self) -> None:
         catalog = _catalog_with_one()
         candidate = _candidate_from_catalog(catalog)
