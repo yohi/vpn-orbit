@@ -1,9 +1,9 @@
-# VPN-ORBIT — Stage 1 Pre-Live Readiness Design R0.1.1
+# VPN-ORBIT — Stage 1 Pre-Live Readiness Design R0.1.2
 
-**Status:** LIMITED_DOCUMENT_REMEDIATION / OWNER_ADOPTION_OF_R0.1.1_PENDING  
-**Prior adoption:** Human Owner approved Design R0.1; this revision only addresses RG-VOR-010-001〜005  
+**Status:** LIMITED_DOCUMENT_REMEDIATION / OWNER_ADOPTION_OF_R0.1.2_PENDING  
+**Prior adoption:** Human Owner approved Design R0.1; RG-VOR-010-001〜005 remain RESOLVED; R0.1.2 addresses RG-VOR-010-006 only  
 **Repository:** `yohi/vpn-orbit`  
-**Reviewed HEAD:** `fb81579e32f0c7ba0da90853123c449bf0fb442e`  
+**Reviewed HEAD:** `07b89a2e1d83cdc6321d359141c9bbb4826ad450`  
 **Baseline:** `master@7f1ae8cab84a94cea8369e8075b4982b652f1557`  
 **Related:** [Issue #9](https://github.com/yohi/vpn-orbit/issues/9) / [PR #10](https://github.com/yohi/vpn-orbit/pull/10) / PR #8 (merged)  
 **Selected Approach:** A — master限定補強（変更なし）
@@ -106,7 +106,7 @@ COMPLETED -- 次の試行 --> 自動遷移しない。新規OwnerApprovalが必�
 
 記録項目: attempt_id、candidate_id、ingress IP/port/protocol、Git HEAD、approval_id、開始/終了時刻、phase、ProbeStatus、固定reason_code、CLI終了コード、Cleanup status、TUN/DROP/HTTPS/GeoIP段階証拠。APIキー、OpenVPNプロファイル本文・生ログ、認証情報、秘密鍵、トークンを保存しない。
 
-## 7. Result Contract — RG-VOR-010-003
+## 7. Result Contract — RG-VOR-010-003/006
 
 既存 `ProbeStatus` は `PASS / NOT_VERIFIED / BLOCKED / FAIL` のまま。`RESULT_UNKNOWN` はJournal回収状態であり、ProbeStatusではない。
 
@@ -129,7 +129,27 @@ COMPLETED -- 次の試行 --> 自動遷移しない。新規OwnerApprovalが必�
 
 `cleanup_status` は既存の値のみを採用し、`failed` は必ず最終FAIL。段階的な検証の途中で失敗したからといって、未到達の後続証拠をFAILEDにしない。`ProbeResult`に存在しないOpenVPNプロセスexit codeは取得元として使用しない。`reason_codes` は固定コードallowlistからのみ生成する。
 
-JournalとCLIのJSONは `attempt_id` で照合できる。CLI出力不能時も予約レコードを `RESULT_UNKNOWN` として読み取れる。JSONへの投影失敗、Journal確定失敗はPASS出力禁止。
+JournalとCLIのJSONは `attempt_id` で照合できる（予約前のCLI拒否では `attempt_id=null`）。**予約済み**の結果が回収不能な場合に限り、その未確定レコードを `RESULT_UNKNOWN` として扱う。JSONへの投影失敗、Journal確定失敗はPASS出力禁止。
+
+### 7.3 固定候補CLI応答とJournal回収状態 — RG-VOR-010-006
+
+この対応表は `--probe-id` の**今回のCLI応答JSON**にのみ適用する。`--list` は候補一覧専用であり、試行済みを表すJSONではない。CLI応答型 `CliProbeOutcome` は `status: Literal["PASS", "NOT_VERIFIED", "BLOCKED", "FAIL"] | None`、`recovery_state: Literal["NOT_STARTED", "FINALIZED", "RESULT_UNKNOWN"]`、`reason_codes: list[str]` を持つ。`NOT_STARTED` は**CLI応答専用**で、既存の `JournalResult.recovery_state: Literal["FINALIZED", "RESULT_UNKNOWN"]` および `ProbeStatus` は変更しない。
+
+| 今回の `--probe-id` の状況 | CLI `status` | CLI `recovery_state` | CLI `reason_codes`（固定コード） |
+|---|---|---|---|
+| Issue #9の既存HOLD、OwnerApproval欠落・不一致・使用済み、空Journalでも承認なし | `BLOCKED` | `NOT_STARTED` | `legacy_unknown_owner_decision_required`（旧試行のHOLD時）、それ以外は `preflight_blocked` |
+| CLI引数不正、権限不正、既存の未確定予約、ロック取得不可、Journal予約前の他の安全拒否 | `BLOCKED` | `NOT_STARTED` | `preflight_blocked` |
+| 固定候補IDが現行候補一覧に存在しない（変更・消失を含む） | `NOT_VERIFIED` | `NOT_STARTED` | `candidate_not_found` |
+| 予約後、`mark_running()`が永続化できず、`probe_one()`を**一度も呼んでいないことが確実** | `BLOCKED` | `NOT_STARTED` | `probe_start_blocked` |
+| `probe_one()`呼出後、結果を回収できない（起動有無が不確実な中断を含む） | `null` | `RESULT_UNKNOWN` | `attempt_result_unavailable` |
+| `probe_one()`後、Journalの `complete()` に失敗して最終結果を永続化できない | `null` | `RESULT_UNKNOWN` | `journal_finalization_failed` |
+| Probe結果を回収し、Journalの `COMPLETED` 永続化にも成功 | `ProbeResult.status.value` | `FINALIZED` | 検証済み `ProbeResult.reason_code` をallowlistから投影 |
+
+- **試行の帰属:** `LEGACY_RESULT_UNKNOWN` はIssue #9で記録された過去の可能性のある試行のみを指す。現在の新規試行の `recovery_state` には使用しない。旧HOLDを検出して今回のCLIが停止した場合、今回の状態は常に `NOT_STARTED`。過去の試行を新Journalに成功・失敗・今回実行済みとして遡及登録しない。
+- **開始判定:** `NOT_STARTED` は、今回 `probe_one()` が未呼出であると確実に断定できる場合に限る。`mark_running()` 永続化後のクラッシュ等、呼出の有無を確証できない場合は保守的に `RESULT_UNKNOWN` として新規実行を止める。予約済みレコードが未確定なら、CLIが `NOT_STARTED` を返した場合もJournalの全候補HOLDを解除しない。
+- **未開始・未回収の値:** 予約前の拒否は `attempt_id=null`、予約後に未開始と確認できる場合は当該 `AttemptHandle.attempt_id`。いずれも `exit_code=null`、`phase="not_started"`、証拠4項目は `NOT_OBSERVED`、Probe未実行につき `cleanup_status="not_required"`（ProbeのCleanupが実行されたという主張ではない）。`RESULT_UNKNOWN` でも `exit_code=null` とし、観測済みの安全な固定コード以外を推測で追加しない。
+- **終了値:** `FINALIZED` の場合だけ、既存§7.1の条件に従い `exit_code=0|1`（当該CLIの**予定**終了コード）を付ける。事前拒否時にOSが返す非0のシェル終了コードとは別の意味であり、その値をJSON `exit_code` に転用しない。
+- **安全性:** 上表の `reason_codes` は固定allowlistのみ使用し、生ログ・例外本文・OpenVPNプロファイルを出力しない。Journal確定失敗や帰属不明時に `PASS`、`FINALIZED` または新しい試行の成功・失敗を作り出さない。既存のCleanup FAIL優先、Issue #9の既定HOLD、全体排他は維持する。
 
 ## 8. Scope Boundaries
 
@@ -164,8 +184,8 @@ Runbookは実機検証前にIssue #9の既知結果不明試行を確認し、**
 ## 12. Authority
 
 - Design R0.1: **APPROVED**（方式Aを維持）
-- Design R0.1.1: **PENDING_OWNER_ADOPTION**（今回限定訂正版）
-- Implementation Plan R0.1.1: **PENDING_OWNER_ADOPTION**
+- Design R0.1.2: **PENDING_OWNER_ADOPTION**（RG-VOR-010-006限定訂正版）
+- Implementation Plan R0.1.2: **PENDING_OWNER_ADOPTION**
 - Implementation Authorization: **HOLD**
 - Source Code Modification / Test Execution: **HOLD**
 - GitHub Commit / Push / PR Update / Merge: **HOLD**
