@@ -1,4 +1,4 @@
-# VPN-ORBIT Stage 1 Pre-Live Readiness Implementation Plan R0.1.1
+# VPN-ORBIT Stage 1 Pre-Live Readiness Implementation Plan R0.1.2
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` or `superpowers:subagent-driven-development` only when implementation is separately authorized. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -6,9 +6,9 @@
 **Goal:** 最新masterに固定候補実行、安全な直接通信遮断証拠、実行結果回収を統合し、実機検証直前の状態を完成させる。  
 **Architecture:** 既存Cloud Probe、OpenVPN Probe、Supervisor、Isolation、Cleanupを再利用する。固定候補CLIとAttempt Journalを追加し、実通信前に候補同一性、Issue #9旧試行HOLD、新しいOwner承認、Stage 1全体の排他を確定する。  
 **Tech Stack:** Python 3.11+、標準ライブラリ、unittest、Linux Network Namespace、nftables、OpenVPN。  
-**Spec:** [Design R0.1.1（限定訂正版・Owner採択待ち）](../specs/2026-11-22-vpn-orbit-stage1-pre-live-readiness-design.md)  
+**Spec:** [Design R0.1.2（RG-VOR-010-006限定訂正版・Owner採択待ち）](../specs/2026-11-22-vpn-orbit-stage1-pre-live-readiness-design.md)  
 **Baseline:** `master@7f1ae8cab84a94cea8369e8075b4982b652f1557`  
-**Reviewed HEAD:** `fb81579e32f0c7ba0da90853123c449bf0fb442e`  
+**Reviewed HEAD:** `07b89a2e1d83cdc6321d359141c9bbb4826ad450`  
 **Related:** [Issue #9](https://github.com/yohi/vpn-orbit/issues/9) / PR #10 / PR #8 merged
 
 ## Global Constraints
@@ -175,7 +175,7 @@ class AttemptJournal:
 
 **Acceptance:** Task 4は公開 `inspect/read_approval/reserve/mark_running/complete/AttemptHandle` のみで動作。空Journal、過去未回収、別候補並列、未確定、記録失敗からOpenVPNへ到達しない。
 
-### Task 4: 固定候補CLI・結果投影・回収 — RG-VOR-010-001/002/003
+### Task 4: 固定候補CLI・結果投影・回収 — RG-VOR-010-001/002/003/006
 
 **Files:** Create `vpn_orbit/stage1_fixed_probe.py`、`tests/test_stage1_fixed_probe.py`。Modify minimally `vpn_orbit/openvpn_probe.py` for HTTPS成功マーカー。Reuse Task 1〜3、既存 `probe_one()`。
 
@@ -204,14 +204,14 @@ def main(argv: list[str] | None = None) -> int: ...
 
 | Field / Type | Source | 未取得・未到達の値 |
 |---|---|---|
-| `attempt_id: str | null` | `AttemptHandle.attempt_id` | 予約前ならnull |
+| `attempt_id: str | null` | `AttemptHandle.attempt_id` | 予約前ならnull。予約済みでProbe未呼出が確実な場合は実際のattempt_idを残す |
 | `candidate_id: str | null` | Task 1固定候補照合 | 未確定ならnull。指定値を照合済みと偽装しない |
-| `status: str | null` | `ProbeResult.status.value` | Probe未実行・結果未回収ならnull。CLI拒否状態は固定reason_codeで示す |
-| `recovery_state: str` | `FINALIZED` / `RESULT_UNKNOWN` | 未確定なら `RESULT_UNKNOWN` |
-| `reason_codes: list[str]` | 既存固定 `ProbeResult.reason_code` とCLI固定拒否コードのallowlist | 不明文字列は固定の非秘匿エラーコードへ正規化 |
-| `exit_code: int | null` | **固定候補CLIが返す予定のコード**。PASS + cleanup confirmed + Journal確定なら0、その他の確定結果は1 | 予約／実行中／結果未回収ならnull。OpenVPN終了コードではない |
-| `phase: str` | `ProbeResult.phase` の許可済み固定phase | `not_started` |
-| `cleanup_status: str` | `ProbeResult.cleanup_status` の既存許可値 | `not_required`等、推測しない |
+| `status: str | null` | `NOT_STARTED`時はCLIの固定拒否状態 `BLOCKED` / `NOT_VERIFIED`；`FINALIZED`時は `ProbeResult.status.value` | `RESULT_UNKNOWN`時だけnull。未開始を実行済みとみなさない |
+| `recovery_state: str` | CLI専用 `NOT_STARTED` またはJournal由来 `FINALIZED` / `RESULT_UNKNOWN` | Probe未呼出が確実なら `NOT_STARTED`；開始有無不明・回収不能なら `RESULT_UNKNOWN` |
+| `reason_codes: list[str]` | `NOT_STARTED`時はCLIの固定拒否コード、`FINALIZED`時は `ProbeResult.reason_code` allowlist、`RESULT_UNKNOWN`時は固定回収不能コード | 不明文字列は固定の非秘匿コードへ正規化。旧 `LEGACY_RESULT_UNKNOWN` を今回の状態として記録しない |
+| `exit_code: int | null` | **固定候補CLIが返す予定のコード**。`FINALIZED` かつPASS + cleanup confirmedなら0、その他の確定結果は1 | `NOT_STARTED`/`RESULT_UNKNOWN` は常にnull。CLI拒否時の実シェル終了コードでもOpenVPN終了コードでもない |
+| `phase: str` | `FINALIZED`時は `ProbeResult.phase` の許可済み固定phase | `NOT_STARTED`時は `not_started`。`RESULT_UNKNOWN`時は最後に確証できた固定phaseのみ |
+| `cleanup_status: str` | `FINALIZED`時は `ProbeResult.cleanup_status` の既存許可値 | 今回のProbe未呼出が確実な `NOT_STARTED`時は `not_required`。`RESULT_UNKNOWN`時は確認値のみ、確認不能なら `not_required` を成功証拠として使用しない |
 | `tun_evidence: EvidenceState` | `tls_tun_established:` の既存成功マーカー → VERIFIED；`tun_not_established`/`tun_ip_invalid` → FAILED | NOT_OBSERVED |
 | `drop_evidence: EvidenceState` | **新規** `direct_drop_counter_verified` のみ → VERIFIED；`drop_*`/`host_direct_echo_route:*` → FAILED | NOT_OBSERVED |
 | `tunnel_https_evidence: EvidenceState` | **新規** `tunnel_https_verified` → VERIFIED；`exit_ip_fetch_failed`/`exit_ip_body_not_global_ipv4` → FAILED | NOT_OBSERVED |
@@ -219,12 +219,28 @@ def main(argv: list[str] | None = None) -> int: ...
 
 `EvidenceState` は `VERIFIED / FAILED / NOT_OBSERVED` の3値のみ。`tunnel_https_verified` は、既存 `curl_via_tun()` のHTTP 200・TLS検証とグローバルIPv4本文の検証が完了した時点でのみ追加。DROP成功はTask 2の正規マーカーのみを信頼する。後続の未到達をFAILEDにしない。`ProbeResult.evidence` 内の不明な情報や生ログをJSONへ透過させない。
 
+**CLI応答の状態対応表（Design §7.3と同一）:**
+
+`CliProbeOutcome`: `status: Literal["PASS", "NOT_VERIFIED", "BLOCKED", "FAIL"] | None`、`recovery_state: Literal["NOT_STARTED", "FINALIZED", "RESULT_UNKNOWN"]`、`reason_codes: list[str]`。`NOT_STARTED` はCLI専用で、Task 3が生成する `JournalResult.recovery_state`（`FINALIZED` / `RESULT_UNKNOWN`）は変更しない。以下は `--probe-id` 応答に適用し、`--list` は試行JSONとして扱わない。
+
+| 今回の `--probe-id` の状況 | CLI `status` | CLI `recovery_state` | CLI `reason_codes`（固定コード） |
+|---|---|---|---|
+| Issue #9の既存HOLD、OwnerApproval欠落・不一致・使用済み、空Journalでも承認なし | `BLOCKED` | `NOT_STARTED` | `legacy_unknown_owner_decision_required`（旧試行のHOLD時）、それ以外は `preflight_blocked` |
+| CLI引数不正、権限不正、既存の未確定予約、ロック取得不可、Journal予約前の他の安全拒否 | `BLOCKED` | `NOT_STARTED` | `preflight_blocked` |
+| 固定候補IDが現行候補一覧に存在しない（変更・消失を含む） | `NOT_VERIFIED` | `NOT_STARTED` | `candidate_not_found` |
+| 予約後、`mark_running()`が永続化できず、`probe_one()`を**一度も呼んでいないことが確実** | `BLOCKED` | `NOT_STARTED` | `probe_start_blocked` |
+| `probe_one()`呼出後、結果を回収できない（起動有無が不確実な中断を含む） | `null` | `RESULT_UNKNOWN` | `attempt_result_unavailable` |
+| `probe_one()`後、Journalの `complete()` に失敗して最終結果を永続化できない | `null` | `RESULT_UNKNOWN` | `journal_finalization_failed` |
+| Probe結果を回収し、Journalの `COMPLETED` 永続化にも成功 | `ProbeResult.status.value` | `FINALIZED` | 検証済み `ProbeResult.reason_code` をallowlistから投影 |
+
+`NOT_STARTED` は今回の `probe_one()` 未呼出が確実な場合に限る。`mark_running()`永続化後にクラッシュし、呼出有無が不明なら `RESULT_UNKNOWN`。`NOT_STARTED`でも予約済み未確定レコードがあればJournalの全候補HOLDを維持する。Issue #9の旧試行は独立した `LEGACY_RESULT_UNKNOWN` として残し、今回の `recovery_state` には転記しない。`NOT_STARTED`時の `exit_code=null`、`phase="not_started"`、4証拠 `NOT_OBSERVED`、Probe未呼出で `cleanup_status="not_required"`。`RESULT_UNKNOWN`では `exit_code=null` とし、確認済みの情報以外を推測しない。`FINALIZED`だけ予定CLI終了コード `0|1` を記録する。成功や失敗の偽装、秘密情報・例外本文・生ログの透過出力は禁止。
+
 - [ ] Step 1: `test_list_never_invokes_probe`、`test_exact_id_invokes_probe_once`、`test_missing_candidate_never_reserves_or_probes` を追加。
 - [ ] Step 2: `python3 -m unittest tests.test_stage1_fixed_probe -v` でREDを確認。
 - [ ] Step 3: `main(argv)`、候補ID照合、Journal公開API、`probe_one()`単発呼出、結果投影、JSON出力を実装。
-- [ ] Step 4: `test_issue9_unknown_blocks_empty_journal_without_owner_decision`、`test_issue9_unknown_blocks_different_candidate_without_owner_decision`、`test_owner_approval_must_reference_issue9_and_new_single_attempt`、`test_used_approval_cannot_relaunch`、`test_existing_unknown_attempt_blocks_probe` を追加してRED→GREEN。
-- [ ] Step 5: `test_parallel_different_candidate_is_blocked`、`test_mark_running_failure_never_calls_probe`、`test_journal_complete_failure_never_reports_pass`、`test_cleanup_failure_overrides_pass` をRED→GREEN。
-- [ ] Step 6: `test_exit_code_is_nullable_and_cli_not_openvpn`、`test_tun_drop_https_tokyo_evidence_projection`、`test_drop_unverified_is_not_verified`、`test_unreached_is_not_observed`、`test_result_unknown_has_null_exit_code`、`test_json_redacts_secrets_and_raw_profile`、`test_untrusted_errors_emit_fixed_codes_only` をRED→GREEN。
+- [ ] Step 4: `test_issue9_unknown_blocks_empty_journal_without_owner_decision`、`test_issue9_unknown_blocks_different_candidate_without_owner_decision`、`test_owner_approval_must_reference_issue9_and_new_single_attempt`、`test_used_approval_cannot_relaunch`、`test_existing_unknown_attempt_blocks_probe`、`test_pre_reservation_rejection_is_not_started`、`test_legacy_unknown_does_not_become_new_attempt_unknown` を追加してRED→GREEN。
+- [ ] Step 5: `test_parallel_different_candidate_is_blocked`、`test_mark_running_failure_never_calls_probe`、`test_no_probe_invocation_after_reservation_reports_not_started`、`test_journal_complete_failure_never_reports_pass`、`test_cleanup_failure_overrides_pass` をRED→GREEN。
+- [ ] Step 6: `test_exit_code_is_nullable_and_cli_not_openvpn`、`test_tun_drop_https_tokyo_evidence_projection`、`test_drop_unverified_is_not_verified`、`test_unreached_is_not_observed`、`test_result_unknown_has_null_exit_code`、`test_started_attempt_without_result_is_unknown`、`test_journal_finalization_failure_never_reports_success`、`test_json_redacts_secrets_and_raw_profile`、`test_untrusted_errors_emit_fixed_codes_only` をRED→GREEN。
 - [ ] Step 7: `python3 -m unittest tests.test_stage1_fixed_probe -v` でGREEN確認。
 - [ ] Step 8: `python3 -m unittest tests.test_stage1_fixed_candidates tests.test_stage1_attempt_journal tests.test_stage1_fixed_probe tests.test_openvpn_probe -v` でTask 1〜4をまとめて回帰確認。
 
@@ -266,7 +282,7 @@ def main(argv: list[str] | None = None) -> int: ...
 
 - HEAD・環境不一致、Namespace/OpenVPN等の不明残存、候補ID不一致、APIキー取扱不明、**Issue #9旧試行に対する新規Owner判断欠落**、空Journalを根拠とする実行、承認ID再利用、別候補並列、未確定試行、Journal書込み失敗、DROP証拠欠落、Cleanup異常はFail-Closed。
 - Design R0.1: APPROVED（方式A維持）
-- Design R0.1.1 / Plan R0.1.1: PENDING_OWNER_ADOPTION
+- Design R0.1.2 / Plan R0.1.2: PENDING_OWNER_ADOPTION
 - Implementation / Source Changes / Test Execution: HOLD
 - GitHub Commit / Push / PR Update / Merge: HOLD
 - KVM / GitHub Actions Live: HOLD
