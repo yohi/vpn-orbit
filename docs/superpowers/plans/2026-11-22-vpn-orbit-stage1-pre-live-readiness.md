@@ -1,14 +1,14 @@
-# VPN-ORBIT Stage 1 Pre-Live Readiness Implementation Plan R0.1.2
+# VPN-ORBIT Stage 1 Pre-Live Readiness Implementation Plan R0.1.3
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` or `superpowers:subagent-driven-development` only when implementation is separately authorized. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Status:** LIMITED_DOCUMENT_REMEDIATION / PENDING_OWNER_ADOPTION / IMPLEMENTATION_HOLD  
 **Goal:** 最新masterに固定候補実行、安全な直接通信遮断証拠、実行結果回収を統合し、実機検証直前の状態を完成させる。  
-**Architecture:** 既存Cloud Probe、OpenVPN Probe、Supervisor、Isolation、Cleanupを再利用する。固定候補CLIとAttempt Journalを追加し、実通信前に候補同一性、Issue #9旧試行HOLD、新しいOwner承認、Stage 1全体の排他を確定する。  
+**Architecture:** 既存Cloud Probe、OpenVPN Probe、Supervisor、Isolation、Cleanupを再利用する。固定候補CLIとAttempt Journalを追加し、実通信前に候補同一性、Issue #9旧試行HOLD、新しいOwner承認、**固定候補CLI経由の全candidate IDの排他**を確定する。既存 `cloud_probe` は排他対象外。  
 **Tech Stack:** Python 3.11+、標準ライブラリ、unittest、Linux Network Namespace、nftables、OpenVPN。  
-**Spec:** [Design R0.1.2（RG-VOR-010-006限定訂正版・Owner採択待ち）](../specs/2026-11-22-vpn-orbit-stage1-pre-live-readiness-design.md)  
+**Spec:** [Design R0.1.3（RG-VOR-010-002/004限定訂正版・Owner採択待ち）](../specs/2026-11-22-vpn-orbit-stage1-pre-live-readiness-design.md)  
 **Baseline:** `master@7f1ae8cab84a94cea8369e8075b4982b652f1557`  
-**Reviewed HEAD:** `07b89a2e1d83cdc6321d359141c9bbb4826ad450`  
+**Reviewed HEAD:** `d3fe47e1ac1a14cfd40fadd9b1b7d3b29e55dbbe`  
 **Related:** [Issue #9](https://github.com/yohi/vpn-orbit/issues/9) / PR #10 / PR #8 merged
 
 ## Global Constraints
@@ -18,7 +18,7 @@
 - 今回の文書訂正ではKVM/GitHub Actions実通信、コード変更、テスト実行をしない。
 - Supervisor、Namespace、Cleanupの基本構造、TLS/DNS/IPv6拒否・秘密情報境界を緩和しない。
 - **Issue #9の既知LEGACY_RESULT_UNKNOWNを空Journalで解除しない。** 新規試行にはHuman Ownerの単発明示承認を必須とする。
-- Stage 1全候補を通じて同時実行は1件。未確定試行があれば別候補も含め新規起動を拒否する。
+- **固定候補CLI経由の全candidate IDに対して**同時実行は1件。Journal未確定試行があれば固定候補CLIからの別候補起動も拒否する。既存 `vpn_orbit.cloud_probe` はJournalを通らず排他保証対象外であり、この承認で既存CLIの追加実通信を許可しない。
 - DROP証拠欠落／取得失敗／不増加は最終 `ProbeResult.status=FAIL`、Cleanup失敗のFAIL優先を保持する。
 - `RESULT_UNKNOWN` はJournal回収状態であり既存 `ProbeStatus` に追加しない。
 - `exit_code: int | None` はCLIが返す予定のコード（OpenVPN子プロセス終了コードではない）。未回収時はnull。
@@ -30,7 +30,7 @@
 1. 同じIP:portでプロファイルが変わる → 旧IDでは起動しない（Task 1）。
 2. curl timeoutでもDROP counter不増加 → `probe_one()`の**最終FAIL**（Task 2）。
 3. 新Journalが空でもIssue #9旧試行の結果不明 → Owner未承認なら起動不可（Task 3/4）。
-4. 別candidate IDでの同時試行 → Stage 1グローバルロックで拒否（Task 3/4）。
+4. 固定候補CLIを通した別candidate IDの同時試行 → **固定CLI共通ロック**で拒否。既存cloud_probeには共有されない（Task 3/4）。
 5. DROP JSON破損またはJournal確定失敗 → 最終FAIL／RESULT_UNKNOWN、PASS禁止（Task 2〜4）。
 
 ## File Structure
@@ -78,7 +78,7 @@ screen_candidates(
 
 ### Task 2: DROP証拠と最終FAIL正規化 — RG-VOR-010-004
 
-**Files:** Modify `vpn_orbit/live_runner.py` の `host_direct_route_rejected()`、`vpn_orbit/openvpn_probe.py` の `_verify_routes()`。Tests: `tests/_probe_live_cases.py`（`tests/test_openvpn_probe.py`経由）。
+**Files:** Modify `vpn_orbit/live_runner.py` の `host_direct_route_rejected()`、`vpn_orbit/openvpn_probe.py` の `_verify_routes()`。Tests: `tests/_probe_live_cases.py`（`tests/test_openvpn_probe.py`経由）。既存の `route_get_via_tun0()` がecho IPv4 `/32` を `tun0` に設定することを前提とし、その後続処理のみ限定補強する。
 
 **Interface / Produces:**
 
@@ -88,21 +88,31 @@ def host_direct_route_rejected(
 ) -> tuple[bool, str]: ...
 ```
 
-Runnerは成功時に正確に `(True, "direct_drop_counter_verified")` を返す。失敗時はFalseと固定コードのみ。`_verify_routes()`はFalse、予期しないTrue/detail、**DROP呼出しからの `Exception`** を `(ProbeStatus.FAIL, fixed_reason)` に正規化し、既存 `probe_one()` 一般例外の `NOT_VERIFIED` 経路へ伝播させない（`BaseException` は捕捉しない）。Cleanup失敗のFAIL優先は維持。
+Runnerの成功値は正確に `(True, "direct_drop_counter_verified")`。それ以外はFalse＋固定コード。`_verify_routes()` はFalse、不正なTrue/detail、DROP検証呼出しの `Exception` を `(ProbeStatus.FAIL, fixed_reason)` に正規化する（`BaseException` は捕捉しない）。既存Cleanup失敗のFAIL優先を維持する。
 
-固定失敗コード: `drop_curl_not_refused`、`drop_counter_unavailable`、`drop_counter_invalid`、`drop_counter_not_advanced`、`drop_evidence_unavailable`。秘密情報、生JSON、生コマンド出力を含めない。
+**安全な計測手順（Design §5と同一）:**
 
-- [ ] Step 1: `test_curl_refused_and_counter_advanced_is_verified`、`test_curl_timeout_without_counter_increment_is_fail` を追加。専用ルールのveth・IPv4・TCP/443・識別子とカウンター差分をassert。
+1. 既存 `route_get_via_tun0()` が確立したecho IPv4 `/32 dev tun0` routeを検査・保存する。対象IPは既存で検証済みのglobal IPv4のみ。
+2. Namespace既存の `inet <resources.table> output` に、echo IPv4/TCP443/`oifname <veth_ns>` に限定した `counter drop` を**先に**置く。ルール識別子、完全一致する条件、送出前パケットカウンターを確認。失敗ならパケット送出禁止。
+3. echo IPv4の `/32` routeのみを一時的に `via 10.253.240.1 dev <veth_ns>` に切替。通常の `ip -4 route get <echo_ip>` とroute一覧でvethとgatewayへの到達経路を検証。デフォルト経路・他宛先・VPN peerの許可経路は変更しない。`ip route get ... oif` 単独の成功は根拠にしない。
+4. 元のcurlを、HTTPS/`--noproxy '*'`/`--resolve api.ipify.org:443:<echo_ip>`/`--interface if!<veth_ns>`/TCP443/既存短時間timeoutに固定して**1回だけ**送出。curl終了コード7/28と、同じ `counter drop` ルールのpacketカウンターの厳密な増加が必要。カウンターが増えなければ遮断証拠なし。
+5. `finally` で、成功・失敗・例外・期限切れを問わず **echo IPv4 `/32` を保存した `tun0` routeへ戻し**、通常route getとroute一覧により復元・veth向け一時route不在を確認。その**後**で所有する専用DROPルールを識別子で撤去・不在確認。復元不能時はルールを先に撤去せず、FAILとして既存Supervisor/Namespace Cleanupへ移る。復元確認できなければTUN HTTPSへ進めない。
+6. 送出・カウンター増加・経路復元・ルール撤去の全条件が確認できた場合だけ成功マーカーを生成する。
+
+固定失敗コード: `drop_curl_not_refused`、`drop_counter_unavailable`、`drop_counter_invalid`、`drop_counter_not_advanced`、`drop_route_unavailable`、`drop_route_restore_failed`、`drop_rule_cleanup_failed`、`drop_evidence_unavailable`。生JSONやsecretを公開しない。
+
+- [ ] Step 1: `test_curl_refused_and_counter_advanced_is_verified`、`test_curl_timeout_without_counter_increment_is_fail` を追加。専用ルールの条件・識別子・カウンター差分をassert。
 - [ ] Step 2: `test_counter_read_failure_is_fail`、`test_malformed_nft_json_is_fail`、`test_unexpected_counter_identity_is_fail`、`test_direct_curl_success_is_fail` を追加。
-- [ ] Step 3: `test_drop_counter_error_yields_probe_fail_not_not_verified`、`test_drop_json_error_yields_probe_fail`、`test_drop_rule_mismatch_yields_probe_fail`、`test_drop_counter_no_increment_yields_probe_fail` を追加し、各 `probe_one()` の最終 `result.status == ProbeStatus.FAIL` をassert。Cleanup失敗のFAIL優先もassert。
-- [ ] Step 4: `python3 -m unittest tests.test_openvpn_probe -v` でREDを確認。
-- [ ] Step 5: Runnerに専用 `counter drop`（Namespace output、echo IP/TCP443/veth限定）の作成、前後カウンター読込、同一識別子の検証を実装。`ip route get ... oif` は補助情報に留める。
-- [ ] Step 6: `_verify_routes()`で例外・不正detailのFAIL変換を実装。成功時のみ固定 `direct_drop_counter_verified` を `ProbeResult.evidence` に追加。
-- [ ] Step 7: 上記モジュールでGREEN確認。TUN HTTPS許可・デフォルト経路不変・Cleanup優先も回帰。
+- [ ] Step 3: `test_drop_rule_installed_before_temporary_route`、`test_no_packet_if_drop_rule_missing`、`test_temporary_echo_32_route_points_to_veth`、`test_only_one_bounded_echo_packet_is_attempted` を追加。コマンド順序、対象echo/32以外の経路不変、curlの固定引数を検証。
+- [ ] Step 4: `test_tun0_echo_route_restored_before_drop_rule_removed`、`test_route_restore_failure_yields_probe_fail`、`test_drop_rule_cleanup_failure_yields_probe_fail`、`test_counter_increment_without_route_restoration_is_not_pass` を追加。成功時・失敗時・例外時の復旧順序と未到達TUN HTTPSをassert。
+- [ ] Step 5: `test_drop_counter_error_yields_probe_fail_not_not_verified`、`test_drop_json_error_yields_probe_fail`、`test_drop_rule_mismatch_yields_probe_fail`、`test_drop_counter_no_increment_yields_probe_fail` を追加し、各 `probe_one()` 最終 `result.status == ProbeStatus.FAIL` をassert。復元・撤去失敗でも最終FAIL、Cleanup失敗は `cleanup_failed:*` 優先とする。
+- [ ] Step 6: `python3 -m unittest tests.test_openvpn_probe -v` でREDを確認。
+- [ ] Step 7: Runnerに上記専用ルール、限定route切替、送出、前後カウンター、`finally` 復元・撤去を実装。`_verify_routes()` で固定FAIL正規化し、全条件成立時のみ `direct_drop_counter_verified` を `ProbeResult.evidence` に追加。
+- [ ] Step 8: 同テストでGREEN確認。TUN HTTPS許可、ホストデフォルトルート不変、Namespace Cleanup、Cleanup失敗優先を回帰。
 
-**Acceptance:** nftables取得失敗、JSON破損、識別不一致、カウンター不増加は最終FAIL。Mock PASSは実カーネルのDROP実証ではない。
+**Acceptance:** ルール未設置時は送出なし。計測中のveth `/32` は限定的・一時的。ルート復元とルール撤去が確認できない限りPASSなし。実カーネルでの到達・DROPカウンター増加・TUN HTTPS成功は `NOT_VERIFIED` のまま（このTaskではテストも実通信も未実行）。
 
-### Task 3: Journal、Issue #9 Legacy HOLD、全体排他 — RG-VOR-010-001/002/003
+### Task 3: Journal、Issue #9 Legacy HOLD、固定候補CLI内排他 — RG-VOR-010-001/002/003
 
 **Files:** Create `vpn_orbit/attempt_journal.py`、`tests/test_stage1_attempt_journal.py`。
 
@@ -159,7 +169,7 @@ class AttemptJournal:
 
 **Contract:** `/var/lib/vpn-orbit/stage1-attempts` root所有0700、各ファイル0600、symlink禁止。テストは隔離tempdirとMockでroot権限不要。`read_approval()` はOwnerの制限アクセスファイルを**読み取るだけ**。Issue #9の旧結果不明は既定HOLDであり、空Journalでも新しい単発承認がなければBLOCKED。承認内容はDesign §6.1に完全一致。AIは承認を作成・推測しない。
 
-1個のStage 1グローバル `flock(LOCK_NB)` を予約から完了まで保持。`reserve()` はOwner承認の候補ID、HEAD、Issue #9認識、承認ID未消費、他試行の `ACTIVE` / `RESULT_UNKNOWN` 不存在を**ロック下で再確認**し、承認IDを一度消費して予約をfsync。`inspect()`は参考表示であり唯一の実行許可判定にはならない。
+固定候補CLIで共有する1個の `flock(LOCK_NB)` を、candidate IDに関係なく予約から完了まで保持。既存 `vpn_orbit.cloud_probe` はJournalを通らず、この技術的ロックを共有しない（Stage 1全体の排他保証ではない）。`reserve()` はOwner承認の候補ID、HEAD、Issue #9認識、承認ID未消費、他試行の `ACTIVE` / `RESULT_UNKNOWN` 不存在を**ロック下で再確認**し、承認IDを一度消費して予約をfsync。`inspect()`は参考表示であり唯一の実行許可判定にはならない。
 
 状態: `UNRESERVED → RESERVED → RUNNING → COMPLETED`。`RESERVED/RUNNING` で異常終了または記録失敗なら次回の `inspect()` は `has_unresolved=True`（`RESULT_UNKNOWN`）で全候補HOLD。プロセス終了でロックが解放されても未確定ファイルは削除しない。`mark_running()`失敗で `probe_one()` 起動禁止。`complete()`失敗ならCLIはPASS禁止。`AttemptHandle.__exit__` は正常・異常どちらもロック解放。
 
@@ -173,7 +183,7 @@ class AttemptJournal:
 - [ ] Step 8: `test_complete_failure_leaves_unknown_and_never_reports_pass`、`test_null_exit_code_for_unknown`、`test_secret_values_are_not_serialized` をRED→GREENにする。
 - [ ] Step 9: 同テストモジュールを再実行し全PASS確認。
 
-**Acceptance:** Task 4は公開 `inspect/read_approval/reserve/mark_running/complete/AttemptHandle` のみで動作。空Journal、過去未回収、別候補並列、未確定、記録失敗からOpenVPNへ到達しない。
+**Acceptance:** Task 4は公開 `inspect/read_approval/reserve/mark_running/complete/AttemptHandle` のみで動作。空Journal、過去未回収、**固定候補CLI経由の別candidate ID並列**、未確定、記録失敗から無断OpenVPNへ到達しない。既存CLIへの適用は保証しない。
 
 ### Task 4: 固定候補CLI・結果投影・回収 — RG-VOR-010-001/002/003/006
 
@@ -198,7 +208,7 @@ AttemptJournal.complete(handle: AttemptHandle, *, result: JournalResult) -> None
 def main(argv: list[str] | None = None) -> int: ...
 ```
 
-**CLI contract:** `python3 -m vpn_orbit.stage1_fixed_probe --list` / `--probe-id <64-character-id>`。`--list` はCatalog／GeoIP照会のみでOpenVPN起動なし。`--probe-id` は候補完全一致後、`inspect()`とOwnerApprovalの読込みを行い、`reserve()`で再チェックして承認を一度だけ消費。`mark_running()`が永続化に成功した後だけ `probe_one()` を**1回だけ**呼ぶ。フォールバック・自動再試行なし。空JournalでもIssue #9が未判断ならBLOCKED。APIキーはGeoIP用であり、Journal/OpenVPN環境へ渡さない。
+**CLI contract:** `python3 -m vpn_orbit.stage1_fixed_probe --list` / `--probe-id <64-character-id>`。`--list` はCatalog／GeoIP照会のみでOpenVPN起動なし。`--probe-id` は候補完全一致後、`inspect()`とOwnerApprovalの読込みを行い、`reserve()`で再チェックして承認を一度だけ消費。`mark_running()`が永続化に成功した後だけ `probe_one()` を**1回だけ**呼ぶ。固定CLIの**全candidate ID**は同じJournalロックと未確定HOLDを共有する。既存 `vpn_orbit.cloud_probe` はこの契約・ロックを利用しないため、**既存CLIを含む並列実行防止は保証しない**し、今回の承認で既存CLIの追加実通信を許可しない。フォールバック・自動再試行なし。空JournalでもIssue #9が未判断ならBLOCKED。APIキーはGeoIP用であり、Journal/OpenVPN環境へ渡さない。
 
 **JSON / JournalResult の完全投影契約:**
 
@@ -255,11 +265,11 @@ def main(argv: list[str] | None = None) -> int: ...
 - [ ] Step 3: `python3 -m compileall -q vpn_orbit tests` を実行。Expected: 終了コード0。
 - [ ] Step 4: `git diff --check` を実行。Expected: PASS。
 - [ ] Step 5: Catalog/GeoIP/OpenVPN/nftables/RunnerをMockし、ネットワーク実通信を禁止した状態でCLIの正常系・失敗系テストを実行。
-- [ ] Step 6: `docs/stage1-pre-live.md` にホストと `vpn-orbit-probe` の識別、Preflight、固定候補SHA、**Issue #9のLEGACY_RESULT_UNKNOWN確認**、**Ownerによる新たな1試行の承認判断と制限アクセスOwnerApprovalの確認**、空Journalでは許可されないこと、結果回収、実シェル終了コードとJSON予定終了コードの違い、Cleanupの実リソース不存在、RESULT_UNKNOWN時停止、再試行禁止を記載。
+- [ ] Step 6: `docs/stage1-pre-live.md` にホストと `vpn-orbit-probe` の識別、Preflight、固定候補SHA、**Issue #9のLEGACY_RESULT_UNKNOWN確認**、**Ownerによる新たな1試行の承認判断と制限アクセスOwnerApprovalの確認**、空Journalでは許可されないこと、**固定候補CLIに限る全candidate ID排他と既存cloud_probe非対象**、既存CLI/OpenVPN等が動作していないことの事前確認・並行実行禁止（技術的相互排他は未保証）、実行許可は固定CLIの単発承認のみで既存CLIには及ばないこと、DROP計測の一時 `/32` route→tun0復元・専用ルール撤去の確認と失敗時停止、結果回収、実シェル終了コードとJSON予定終了コードの違い、Cleanupの実リソース不存在、RESULT_UNKNOWN時停止、再試行禁止を記載。
 - [ ] Step 7: `test_issue9_unknown_blocks_empty_journal_without_owner_decision` と `test_issue9_unknown_blocks_different_candidate_without_owner_decision` が存在しPASSすることと、Runbookが同一HOLD条件を明記することを確認。
 - [ ] Step 8: 実装差分・テスト結果・未実証事項・残余リスクを最終報告しHuman Owner Checkpointで停止。
 
-**Acceptance:** オフラインTDD・既存回帰PASS、旧試行と新Journal両方のFail-Closed確認、Runbook完成、KVM/GitHub Actions実通信未実施。未実行テストをPASSと呼ばない。
+**Acceptance:** オフラインTDD・既存回帰PASS、旧試行と新Journal両方のFail-Closed確認、固定候補CLIの排他範囲と既存CLIとの技術的非排他をRunbookで明確化し、DROP計測後のtun0経路復元・一時ルール撤去と失敗時FAILを記録する。KVM/GitHub Actions実通信未実施。未実行テストをPASSと呼ばない。
 
 ## Integration and Commit Policy
 
@@ -269,7 +279,7 @@ def main(argv: list[str] | None = None) -> int: ...
 
 1. 承認範囲での実装完成。
 2. オフラインTDD・回帰テストPASS。
-3. Issue #9 legacy HOLD、Stage 1グローバル排他、DROP例外最終FAIL、Journal障害、JSON投影をテスト確認。
+3. Issue #9 legacy HOLD、**固定候補CLI経由の全candidate ID排他**、DROP計測の一時route復元・ルール撤去失敗時の最終FAIL、Journal障害、JSON投影をオフラインテスト確認（既存CLIとの排他・実カーネル挙動は未実証）。
 4. 実行結果・中断状態を回収する仕組み完成。
 5. KVM Pre-Live Runbook完成。
 6. 実カーネル・実通信・東京出口IPv4の未実証を明記。
@@ -282,7 +292,7 @@ def main(argv: list[str] | None = None) -> int: ...
 
 - HEAD・環境不一致、Namespace/OpenVPN等の不明残存、候補ID不一致、APIキー取扱不明、**Issue #9旧試行に対する新規Owner判断欠落**、空Journalを根拠とする実行、承認ID再利用、別候補並列、未確定試行、Journal書込み失敗、DROP証拠欠落、Cleanup異常はFail-Closed。
 - Design R0.1: APPROVED（方式A維持）
-- Design R0.1.2 / Plan R0.1.2: PENDING_OWNER_ADOPTION
+- Design R0.1.3 / Plan R0.1.3: PENDING_OWNER_ADOPTION
 - Implementation / Source Changes / Test Execution: HOLD
 - GitHub Commit / Push / PR Update / Merge: HOLD
 - KVM / GitHub Actions Live: HOLD
