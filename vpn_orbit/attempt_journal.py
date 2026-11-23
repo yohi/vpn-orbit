@@ -119,6 +119,7 @@ class AttemptJournal:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        self._persistence_failures: set[str] = set()
 
     def _prepare(self) -> None:
         if not self.root.exists():
@@ -173,7 +174,11 @@ class AttemptJournal:
         consumed = {str(data["approval_id"]) for _, data in records}
         owner_approval = self.read_approval()
         valid_unused = owner_approval is not None and owner_approval.approval_id not in consumed
-        unresolved = any(data["state"] in ("RESERVED", "RUNNING", "RESULT_UNKNOWN") for _, data in records)
+        unresolved = (
+            any(data["state"] in ("RESERVED", "RUNNING", "RESULT_UNKNOWN") for _, data in records)
+            or bool(self._persistence_failures)
+            or any(self.root.glob("failure-*.json"))
+        )
         active = any(data["state"] == "RUNNING" for _, data in records)
         return JournalSnapshot(not valid_unused, active, unresolved)
 
@@ -214,7 +219,8 @@ class AttemptJournal:
             current = self.read_approval()
             if (current != approval or approval.approval_id in consumed or
                     approval.candidate_id != candidate_id or approval.approved_head != head or
-                    any(data["state"] in ("RESERVED", "RUNNING", "RESULT_UNKNOWN") for _, data in records)):
+                    any(data["state"] in ("RESERVED", "RUNNING", "RESULT_UNKNOWN") for _, data in records)
+                    or self._persistence_failures or any(self.root.glob("failure-*.json"))):
                 raise PermissionError("attempt reservation is blocked")
             attempt_id = secrets.token_hex(16)
             path = self.root / f"attempt-{attempt_id}.json"
@@ -241,6 +247,23 @@ class AttemptJournal:
         if not isinstance(payload, dict) or payload.get("attempt_id") != handle.attempt_id:
             raise OSError("attempt record identity is invalid")
         return payload
+
+    def _mark_persistence_failure(self, attempt_id: str) -> None:
+        self._persistence_failures.add(attempt_id)
+        marker = self.root / f"failure-{attempt_id}.json"
+        descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+                stream.write(attempt_id)
+                stream.flush()
+                os.fsync(stream.fileno())
+            directory_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except FileExistsError:
+            pass
 
     def mark_running(self, handle: AttemptHandle) -> None:
         record = self._record_for(handle)
@@ -293,7 +316,13 @@ class AttemptJournal:
                 try:
                     self._write_record(handle._record_path, record)
                 except OSError:
-                    pass
+                    try:
+                        self._mark_persistence_failure(handle.attempt_id)
+                    except OSError:
+                        # Keep this process fail-closed even if the marker cannot
+                        # itself be persisted; the running-record state survives
+                        # when the first replace did not become visible.
+                        self._persistence_failures.add(handle.attempt_id)
                 raise
         finally:
             handle.release()

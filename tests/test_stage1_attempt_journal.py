@@ -293,6 +293,32 @@ class AttemptJournalTests(unittest.TestCase):
         self.assertEqual(record["state"], "RESULT_UNKNOWN")
         self.assertIsNone(record["status"])
 
+    def test_failed_unknown_rewrite_persists_unresolved_marker(self) -> None:
+        issued = approval()
+        self.approval_file(issued)
+        handle = self.journal.reserve(candidate_id="candidate-a", ingress="1.2.3.4:443/tcp", head="head-a", approval=issued)
+        self.journal.mark_running(handle)
+        real_write_record = self.journal._write_record
+        calls = 0
+
+        def fail_rewrite_after_replace(path, record):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                real_write_record(path, record)
+                raise OSError("directory fsync failed")
+            raise OSError("rewrite failed before replace")
+
+        with patch.object(self.journal, "_write_record", side_effect=fail_rewrite_after_replace):
+            with self.assertRaises(OSError):
+                self.journal.complete(handle, result=result())
+
+        self.assertTrue(self.journal.inspect().has_unresolved)
+        self.assertTrue(list(self.root.glob("failure-*.json")))
+        self.assertTrue(AttemptJournal(self.root).inspect().has_unresolved)
+        record = json.loads(next(self.root.glob("attempt-*.json")).read_text())
+        self.assertEqual(record["state"], "COMPLETED")
+
     def test_unknown_result_remains_unresolved_after_complete(self) -> None:
         issued = approval()
         self.approval_file(issued)
