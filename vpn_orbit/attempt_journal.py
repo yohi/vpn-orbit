@@ -251,8 +251,8 @@ class AttemptJournal:
     def _mark_persistence_failure(self, attempt_id: str) -> None:
         self._persistence_failures.add(attempt_id)
         marker = self.root / f"failure-{attempt_id}.json"
-        descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
+            descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(descriptor, "w", encoding="ascii") as stream:
                 stream.write(attempt_id)
                 stream.flush()

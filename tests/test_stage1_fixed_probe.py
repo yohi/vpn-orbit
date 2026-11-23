@@ -8,6 +8,7 @@ import sys
 import warnings
 import tempfile
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 from unittest.mock import MagicMock, patch
@@ -380,6 +381,19 @@ class ProjectionTests(_JournalTestCase):
         self.assertEqual(payload["drop_evidence"], "VERIFIED")
         self.assertEqual(payload["tunnel_https_evidence"], "VERIFIED")
         self.assertEqual(payload["tokyo_geoip_evidence"], "VERIFIED")
+
+    def test_pass_without_confirmed_cleanup_returns_nonzero(self) -> None:
+        catalog = _catalog_with_one()
+        candidate = _candidate_from_catalog(catalog)
+        cid = candidate_id(candidate)
+        journal, _root, _tmp = _make_journal()
+        _write_approval(journal, _approval(candidate_id=cid))
+        result = replace(_pass_result(), cleanup_status="failed")
+        with patch("vpn_orbit.stage1_fixed_probe.probe_one", return_value=result):
+            rc, payload = _run(["--probe-id", cid], catalog=catalog, journal=journal)
+        self.assertEqual(payload["status"], "PASS")
+        self.assertEqual(payload["exit_code"], 1)
+        self.assertEqual(rc, 1)
 
     def test_fail_exit_code_one(self) -> None:
         catalog = _catalog_with_one()

@@ -319,6 +319,15 @@ class AttemptJournalTests(unittest.TestCase):
         record = json.loads(next(self.root.glob("attempt-*.json")).read_text())
         self.assertEqual(record["state"], "COMPLETED")
 
+    def test_existing_failure_marker_is_tolerated(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        marker = self.root / "failure-existing.json"
+        marker.write_text("existing")
+
+        self.journal._mark_persistence_failure("existing")
+
+        self.assertEqual(marker.read_text(), "existing")
+
     def test_unknown_result_remains_unresolved_after_complete(self) -> None:
         issued = approval()
         self.approval_file(issued)

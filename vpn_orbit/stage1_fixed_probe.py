@@ -10,7 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Final, Literal
 
-from .attempt_journal import AttemptJournal, EvidenceState, JournalResult, OwnerApproval
+from .attempt_journal import AttemptJournal, EvidenceState, JournalResult
 from .cloud_probe import ScreenedCandidate
 from .fixed_candidates import (
     FixedCandidateError,
@@ -465,7 +465,7 @@ def _main(
             head,
         )
         print(_as_json(outcome))
-        return 0 if outcome.status == "PASS" else 1
+        return 0 if outcome.exit_code == 0 else 1
 
     print(_as_json(_not_started("BLOCKED", ["preflight_blocked"])))
     return 1
