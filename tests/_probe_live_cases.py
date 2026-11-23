@@ -16,28 +16,109 @@ class RecordingCommands(Commands):
     def __init__(self):
         super().__init__(time.monotonic() + 30)
         self.calls = []
+        self.drop_counter_increment = True
+        self.counter_read_fails = False
+        self.malformed_counter_json = False
+        self.wrong_counter_identity = False
+        self.drop_rule_install_fails = False
+        self.route_restore_fails = False
+        self.route_restore_unconfirmed = False
+        self.rule_cleanup_fails = False
+        self.curl_returncode = 7
+        self.drop_rule_installed = False
+        self.route_via_veth = False
+        self.original_route_record = {
+            "dst": "1.1.1.1/32", "dev": "tun0", "scope": "link", "protocol": "static",
+            "metric": 77, "prefsrc": "10.8.0.2",
+        }
+        self.current_route_record = self.original_route_record.copy()
+        self.counter = 0
+        self.counter_reads = 0
 
     def run(self, args, *, data=None):
         self.calls.append((list(args), data))
         text = ""
-        if args[:4] == ["ip", "-j", "-4", "addr"]:
-            text = "[]"
-        elif args[:5] == ["ip", "-j", "-4", "route", "get"]:
-            text = '[{"dev":"eth0"}]'
-        elif args[:4] == ["ip", "-j", "-4", "route"]:
-            text = "[]"
+        if "nft" in args and "add" in args:
+            if self.drop_rule_install_fails:
+                return subprocess.CompletedProcess(args, 1, "", "")
+            self.drop_rule_installed = True
+        elif "nft" in args and "list" in args and "chain" in args:
+            self.counter_reads += 1
+            if self.counter_read_fails and self.counter_reads == 1:
+                return subprocess.CompletedProcess(args, 1, "", "")
+            if self.malformed_counter_json and self.counter_reads == 1:
+                return subprocess.CompletedProcess(args, 0, "{invalid", "")
+            if self.drop_rule_installed:
+                expression = [
+                    {"match": {"op": "==", "left": {"meta": {"key": "oifname"}},
+                               "right": "different" if self.wrong_counter_identity else "vn-test"}},
+                    {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "daddr"}},
+                               "right": "1.1.1.1"}},
+                    {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}},
+                               "right": 443}},
+                    {"counter": {"packets": self.counter, "bytes": 0}},
+                    {"drop": None},
+                ]
+                text = json.dumps({"nftables": [{"rule": {"family": "inet", "table": args[-2],
+                    "chain": "output", "handle": 42, "comment": "vpn-orbit-drop-evidence",
+                    "expr": expression}}]})
+            else:
+                text = json.dumps({"nftables": []})
+        elif "nft" in args and "delete" in args and "rule" in args:
+            if self.rule_cleanup_fails:
+                return subprocess.CompletedProcess(args, 1, "", "")
+            self.drop_rule_installed = False
+        elif "route" in args and "replace" in args:
+            if "tun0" in args and self.route_restore_fails:
+                return subprocess.CompletedProcess(args, 1, "", "")
+            route_index = args.index("route")
+            destination_index = route_index + 2
+            parsed_route: dict[str, str | int | list[str]] = {"dst": args[destination_index], "flags": []}
+            if parsed_route["dst"] == "unicast":
+                parsed_route["type"] = "unicast"
+                destination_index += 1
+                parsed_route["dst"] = args[destination_index]
+            options = {"dev": "dev", "scope": "scope", "proto": "protocol",
+                       "metric": "metric", "src": "prefsrc", "table": "table", "via": "gateway"}
+            option_index = destination_index + 1
+            while option_index < len(args):
+                option = args[option_index]
+                field_name = options.get(option)
+                if field_name is None:
+                    option_index += 1
+                    continue
+                parsed_value = args[option_index + 1]
+                parsed_route[field_name] = int(parsed_value) if field_name == "metric" else parsed_value
+                option_index += 2
+            if "tun0" in args and self.route_restore_unconfirmed:
+                self.route_via_veth = True
+            else:
+                self.current_route_record = parsed_route
+                self.route_via_veth = parsed_route.get("dev") == "vn-test"
         elif "route" in args and "show" in args and "-j" in args:
-            text = json.dumps([{"dst":"8.8.8.8", "dev":"vn-test"},
-                {"dst":"10.253.240.0/30", "dev":"vn-test", "protocol":"kernel"}])
+            if "exact" in args:
+                text = json.dumps([self.current_route_record])
+            elif "netns" in args:
+                text = json.dumps([{"dst": "8.8.8.8/32", "dev": "vn-test"},
+                    {"dst": "10.253.240.0/30", "dev": "vn-test", "protocol": "kernel"}])
+            else:
+                text = "[]"
+        elif args[:4] == ["ip", "-j", "-4", "addr"]:
+            text = "[]"
+        elif "route" in args and "get" in args and "-j" in args:
+            text = '[{"dev":"eth0"}]'
         elif "route" in args and "get" in args:
             if "oif" in args:
                 return subprocess.CompletedProcess(args, 2, "", "")
-            text = "1.1.1.1 dev tun0 src 10.8.0.2"
+            text = ("1.1.1.1 via 10.253.240.1 dev vn-test src 10.253.240.2"
+                    if self.route_via_veth else "1.1.1.1 dev tun0 src 10.8.0.2")
         elif "curl" in args:
             if "--write-out" in args:
                 text = "8.8.4.4\n200"
             else:
-                return subprocess.CompletedProcess(args, 7, "", "")
+                if self.drop_rule_installed and self.route_via_veth and self.curl_returncode in (7, 28) and self.drop_counter_increment:
+                    self.counter += 1
+                return subprocess.CompletedProcess(args, self.curl_returncode, "", "")
         return subprocess.CompletedProcess(args, 0, text, "")
 
 
@@ -149,19 +230,14 @@ class LiveRunnerTests(unittest.TestCase):
         self.assertNotIn("--location", args)
 
     def test_direct_rejection_ignores_route_get_exit_but_requires_curl_refusal(self):
-        # Real kernels return 0 for `route get ... oif DEV` (assumed on-link).
-        from unittest import mock
-        def fake(curl_rc):
-            def run(args, *, data=None):
-                rc = 0 if "route" in args else curl_rc
-                return subprocess.CompletedProcess(args, rc, "", "")
-            return run
-        with mock.patch.object(self.commands, "run", side_effect=fake(28)):
-            ok, detail = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
+        self.commands.curl_returncode = 28
+        ok, detail = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
         self.assertTrue(ok)
-        self.assertEqual(detail, "route_exit_0;curl_exit_28")
-        with mock.patch.object(self.commands, "run", side_effect=fake(0)):
-            ok, _ = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
+        self.assertEqual(detail, "direct_drop_counter_verified")
+        self.commands = RecordingCommands()
+        self.runner.commands = self.commands
+        self.commands.curl_returncode = 0
+        ok, _ = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
         self.assertFalse(ok)
 
     def test_direct_route_rejection_uses_veth_not_host_echo(self):
@@ -170,7 +246,6 @@ class LiveRunnerTests(unittest.TestCase):
         ok, detail = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
         # Then route and connection refusal are both required inside the namespace.
         self.assertTrue(ok)
-        self.assertEqual(detail, "route_exit_2;curl_exit_7")  # route exit is informational
-        route, curl = [args for args, _ in self.commands.calls]
-        self.assertEqual(route[-2:], ["oif", "vn-test"])
+        self.assertEqual(detail, "direct_drop_counter_verified")
+        curl = next(args for args, _ in self.commands.calls if "curl" in args)
         self.assertEqual(curl[curl.index("--interface") + 1], "if!vn-test")

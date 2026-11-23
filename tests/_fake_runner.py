@@ -53,6 +53,7 @@ class FakeRunner:
     has_remote_32_route: bool = True
     has_echo_32_route: bool = True
     pre_tunnel_echo_blocked: bool = True
+    host_direct_result: tuple[bool, str] = (True, "direct_drop_counter_verified")
     save_ip_forward_fails: bool = False
     restore_ip_forward_fails: bool = False
     ip_forward_saved: bool = False
@@ -159,7 +160,7 @@ class FakeRunner:
 
     def host_direct_route_rejected(self, echo_ip: str, resources: IsolationResources,
                                   deadline: float) -> tuple[bool, str]:
-        return True, "direct_route_rejected"
+        return self.host_direct_result
 
     def save_host_ip_forward(self) -> tuple[bool, str]:
         self.ip_forward_saved = True

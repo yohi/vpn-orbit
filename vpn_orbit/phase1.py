@@ -48,6 +48,7 @@ class Candidate:
     speed_bps: int
     score: int
     profile: str
+    profile_raw_bytes: bytes | None = None
 
 
 def require_global_ipv4(value: str) -> str:
@@ -99,6 +100,7 @@ def parse_catalog(data: str, country: str = "JP") -> list[Candidate]:
                 host=row["HostName"], ip=ip, country=country,
                 ping_ms=int(row["Ping"]), speed_bps=int(row["Speed"]),
                 score=int(row["Score"]), profile=profile,
+                profile_raw_bytes=raw,
             ))
         except (ValueError, KeyError, TypeError, UnicodeError, UnsupportedProfile):
             continue

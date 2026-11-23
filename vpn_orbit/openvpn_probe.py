@@ -12,9 +12,7 @@ from typing import TYPE_CHECKING, assert_never
 
 from .config_synthesis import _reject_env_secrets, synthesize_openvpn_config
 from .geoip import GeoDecision
-from .openvpn_diagnostics import (
-    OPENVPN_DIAGNOSTIC_CODES, OPENVPN_PROGRESS_CODES, PROCESS_STATES, LINK_IO_CODES,
-)
+from .openvpn_diagnostics import OPENVPN_DIAGNOSTIC_CODES, OPENVPN_PROGRESS_CODES, PROCESS_STATES, LINK_IO_CODES
 from .phase1 import UnsupportedProfile, convert_ovpn
 from .probe_commands import IsolationUnavailable
 from .probe_lifecycle import bounded, cleanup
@@ -41,10 +39,8 @@ class _ProbeState:
     phase: str = "preflight"
 
 
-def _prepare_probe(
-    candidate: ScreenedCandidate, runner: ProbeRunner, work_deadline: float,
-    state: _ProbeState,
-) -> tuple[ProbeStatus, str] | None:
+def _prepare_probe(candidate: ScreenedCandidate, runner: ProbeRunner,
+                   work_deadline: float, state: _ProbeState) -> tuple[ProbeStatus, str] | None:
     try:
         _reject_env_secrets()
     except UnsupportedProfile:
@@ -104,26 +100,33 @@ def _prepare_probe(
     return None
 
 
-def _verify_routes(
-    runner: ProbeRunner, echo_ip: str, resources: IsolationResources,
-    work_deadline: float, evidence: list[str],
-) -> tuple[ProbeStatus, str] | None:
+def _verify_routes(runner: ProbeRunner, echo_ip: str, resources: IsolationResources,
+                   work_deadline: float, evidence: list[str]) -> tuple[ProbeStatus, str] | None:
     ok, detail = runner.route_get_via_tun0(echo_ip, resources, work_deadline)
     if not ok:
         return ProbeStatus.FAIL, "echo_route_not_tun0"
     evidence.append("echo_route:" + detail)
-    ok, detail = runner.host_direct_route_rejected(echo_ip, resources, work_deadline)
-    if not ok:
-        # detail is fixed-format exit codes only (route_exit_N;curl_exit_N)
-        return ProbeStatus.FAIL, "host_direct_echo_route:" + detail
-    evidence.append("host_direct_rejected:" + detail)
+    try:
+        ok, detail = runner.host_direct_route_rejected(echo_ip, resources, work_deadline)
+    except Exception:  # noqa: BLE001 -- DROP evidence failures always fail closed
+        return ProbeStatus.FAIL, "drop_evidence_unavailable"
+    if ok is False:
+        allowed_failures = {
+            "drop_curl_not_refused", "drop_counter_unavailable", "drop_counter_invalid",
+            "drop_counter_not_advanced", "drop_route_unavailable", "drop_route_restore_failed",
+            "drop_rule_cleanup_failed", "drop_evidence_unavailable",
+        }
+        if type(detail) is str and detail in allowed_failures:
+            return ProbeStatus.FAIL, detail
+        return ProbeStatus.FAIL, "drop_evidence_unavailable"
+    if ok is not True or type(detail) is not str or detail != "direct_drop_counter_verified":
+        return ProbeStatus.FAIL, "drop_evidence_unavailable"
+    evidence.append("host_direct_rejected:direct_drop_counter_verified")
     return None
 
 
-def _verify_tunnel(
-    runner: ProbeRunner, work_deadline: float,
-    state: _ProbeState, geo_lookup: Callable[[str], GeoDecision],
-) -> tuple[ProbeStatus, str, str | None]:
+def _verify_tunnel(runner: ProbeRunner, work_deadline: float, state: _ProbeState,
+                   geo_lookup: Callable[[str], GeoDecision]) -> tuple[ProbeStatus, str, str | None]:
     resources = state.resources
     private_dir = state.private_dir
     if resources is None or private_dir is None or resources.config_path is None:
@@ -178,6 +181,7 @@ def _verify_tunnel(
         observed = _global_ipv4(body)
     except (ValueError, UnsupportedProfile):
         return ProbeStatus.NOT_VERIFIED, "exit_ip_body_not_global_ipv4", None
+    state.evidence.append("tunnel_https_verified")
     state.phase = "exit_geoip"
     match geo_lookup(observed):
         case GeoDecision.TOKYO:
@@ -215,6 +219,8 @@ def probe_one(candidate: ScreenedCandidate, *, geo_lookup: Callable[[str], GeoDe
         # Preserve the failing work stage before starting cleanup. Never expose
         # untrusted exception text or OpenVPN output in this public field.
         final_phase = state.phase
+        if state.phase != "not_started":
+            state.evidence.append(f"pre_cleanup_failure:{state.phase}:{reason}")
         try:
             with bounded(deadline):
                 failures = cleanup(runner, state.resources, state.process, state.private_dir, deadline)
