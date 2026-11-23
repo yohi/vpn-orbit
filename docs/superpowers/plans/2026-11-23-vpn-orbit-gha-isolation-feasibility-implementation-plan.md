@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11+標準ライブラリ、Linux iproute2/nftables、GitHub Actions `ubuntu-latest` standard hosted runner、unittest。新規Python依存なし。
 
-**Spec:** `docs/superpowers/specs/2026-11-23-vpn-orbit-zero-cost-tokyo-automation-design.md`（Human Owner採択R0.1。現在はチャット内採択、リポジトリには未反映。実装に先立ち、この採択済み文面と同一のSpecを同じPRに含める）
+**Spec:** `docs/superpowers/specs/2026-11-23-vpn-orbit-zero-cost-tokyo-automation-design.md`（Human Owner ADOPTED R0.1。対象featureブランチに追加済み、master未反映。Spec採択は実装・Commit/Push・Dispatch承認ではない）
 
 ## Global Constraints
 
@@ -16,21 +16,29 @@
 - 追加費用0円：Publicリポジトリのstandard GitHub-hosted Linux Runnerを使用。larger runner、有料プラン、自宅Host、self-hosted runner、Cloudflare Containersは禁止。
 - 初回の検証は**実OpenVPN接続なし**、VPN Gate CSV取得なし、GeoIP照会なし、Cloudflare API/KV書込みなし。
 - `workflow_dispatch`のみ。Cron、push、pull_request、pull_request_target、workflow_runで起動しない。**Workflowはdefault branch上に存在するまで通常はdispatch不可**。新規Workflowをdefault branchへ取り込む操作と実際のDispatchは別々の明示Owner承認を要する。
+- **実行Identity F-001**：Owner承認は`(workflow_definition_commit_sha, workflow_blob_sha, dispatch_ref, code_commit_sha, smoke_blob_sha)`の5要素を**各フルSHA／完全Ref**で特定する。どれか未固定・不一致・未承認ならDispatch不可。`workflow_definition_commit_sha`は実行Workflowを含むCommit、`code_commit_sha`は特権Smokeの凍結済み実装を含むCommitであり、両者は別物として扱う。SmokeはPython標準ライブラリだけをimportする単独ファイル（`python3 -I <絶対パス>`で実行）とし、未承認のリポジトリ内モジュールを特権実行しない。
+- **Dispatch Refの承認**：Workflowは`refs/heads/feature/vpn-orbit-gha-isolation-feasibility-design-20261123`を唯一の許可Refとする（将来Ref変更はOwner再承認）。default branch上でWorkflowを有効化する承認と、対象feature Refの**Workflow定義Commit**を選択して1回Dispatchする承認は別。OwnerはDispatch直前に`dispatch_ref`の現在HEAD、対象WorkflowファイルBlobが承認タプルと一致することをGitHub readbackで確認する。**同一Workflowファイルに自己Commit SHAを埋め込むことはできない**ため、実行中YAMLが自分自身のOwner承認済みCommitであることをYAMLだけで保証したと主張しない。OwnerによるRef/HEAD固定確認が実証不可能な場合はDispatchを承認せずSTOPする。
+- **特権起動前ゲート**：Workflow Jobはcheckout Actionの固定フルSHAと`persist-credentials: false`を用い、先に`github.ref == approved dispatch_ref`を検査。Workflow側checkout HEADが`github.sha`と一致することを確認し、別途承認済み`code_commit_sha`を**SHA指定でcheckout**、`git rev-parse HEAD == code_commit_sha`および`git hash-object vpn_orbit/gha_isolation_feasibility.py == smoke_blob_sha`を確認する。テスト／特権実行は検証済みコードからのみ行う。期待SHAはWorkflow定義に固定し、未承認Ref・未固定SHA・readback失敗・比較不一致ではsudoへ進まず非0終了。`actions/checkout@<SHA>`固定は**Action本体**だけを固定し、Repositoryのcheckout対象Commit/Blobを保証しない。Workflow inputs/`vars`/SecretsによるIdentity上書きを許さない。
 - `permissions: contents: read`、`actions/checkout`は固定SHAを検証して使用し`persist-credentials: false`。workflowにSecretsを注入せず、特権Pythonプロセスへ`GITHUB_TOKEN`・認証情報・環境変数全体を渡さない。
 - Shellの`set -x`を使用せず、出力は固定コード、Python／Kernel version、合否、許可済み一時リソース名とcleanup結果のみ。`env`、secret、Profile原文、Client Key、例外stacktraceは出力しない。
+- **限定OS実行 F-002**：絶対パス`/usr/sbin/ip`、`/usr/sbin/nft`、`/usr/bin/python3`だけ（名前空間内の固定UDP送信コードのみ）を許可し、実行前に`os.geteuid()==0`を確認。`CommandRunner.run()`のみ、`shell=False`、固定`env={"PATH":"/usr/sbin:/usr/bin:/sbin:/bin","LANG":"C","LC_ALL":"C"}`、`cwd="/"`、stdin閉鎖、stdout/stderr各4096 bytes上限、コマンドごと`0 < timeout_s <= 5.0`、Smoke全体90秒上限、timeout時は実行プロセス群kill/wait。非0、起動失敗、超過出力、timeoutは`BLOCKED`とし、Cleanupは別の有界deadlineで試す。raw stderrや例外・環境情報はstdoutへ出さない。
+- **一時リソース F-002**：`scope`は`^[a-z0-9]{1,8}$`、nonceは`secrets.token_hex(4)`の8文字小文字hex。Namespaceは`vof-<scope>-<nonce>-tx`/`-rx`、専用veth名は`vt<nonce>`/`vr<nonce>`、TUN名`voftun0`、nftは**送信Namespace内**の`inet vof_<nonce> out`だけ。Namespaceを2つ作りveth両端を各Namespaceに配置するため、Hostにveth・IP・経路・Firewallを追加しない。両Namespaceにdefault routeを置かない。テスト専用IPv4は`198.18.0.1/30`（送信側）と`198.18.0.2/30`（受信側）のみ。
+- **所有・競合 F-002**：作成前にNamespace名・Link名・nft名の不存在をreadbackし、衝突時は未所有実体に触れず`BLOCKED`。`owned`集合へ入れるのは当該作成がexit 0で完了し、直後readbackで名前・所属Namespace・専用peer等の一致を確認した対象のみ。タイムアウト／出力不明／readback不成立で所有不明の対象は消さず、不確実な残留として`CLEANUP_FAILED`。作成済み他リソースは逆順でCleanup試行し、各失敗後も後続対象を試す。Cleanup完了後、Host IPv4 route全体と`ip_forward`の前後一致、許可済み一時Namespace・veth・TUN・nftの不存在を**独立readback**。未確認・残留・Host状態変化は`CLEANUP_FAILED`優先（CapabilityをPASSにしない）。
+- **許可argv F-002**：`/usr/sbin/ip`の`-j -4 route show`／`netns list`／`netns add|del <owned_ns>`／`-n <owned_ns> link add|set|show|del`（作成したveth・TUNだけ）／`-n <owned_ns> addr add|show`（専用アドレスだけ）／`-n <owned_ns> route get 198.18.0.2`／`-n <owned_ns> tuntap add|del dev voftun0 mode tun`、`ip netns exec <owned_tx_ns> /usr/sbin/nft ...`（下記固定テーブル・チェーン・ルールのadd/list/deleteだけ）、`ip netns exec <owned_tx_ns> /usr/bin/python3 -I -c <固定UDP送信コード定数>`のみ。引数はトークン単位で許可構文と照合する。`sh`/`bash`、`curl`、`openvpn`、apt、外部IP宛接続、任意コマンド、Host route/`ip_forward`変更、Host nft変更は許可しない。
+- **DROP F-003**：送信Namespaceの`nft add table inet vof_<nonce>`、`add chain inet vof_<nonce> out { type filter hook output priority 0; policy accept; }`、`add rule inet vof_<nonce> out oifname vt<nonce> ip daddr 198.18.0.2 udp dport 9 counter drop`（順序・要素固定）を許可。`nft -j list chain inet vof_<nonce> out`から対象ルールの構文、counter packets/bytes、hook等をreadbackし、試験前`before.packets == 0`、送信Namespaceから受信専用vethへ単発UDP（ポート9、payloadは固定3 bytes）、試験後`after.packets - before.packets == 1`かつ`after.bytes > before.bytes`を要求する。送信前にRouteが専用vethに限定されdefault route不在であることを確認。Counter不変・解析不能・ルール不一致・送信失敗は`BLOCKED`。送信成功だけでDROP成功と扱わない。
 - 非Network操作の能力確認でも、操作は実行前に許可された一時リソース名だけ。既存プロセス／Firewall／routeには触れない。
-- cleanupが失敗したら`CLEANUP_FAILED`を優先し、成功を主張しない。検証が未実行なら`NOT_RUN`、能力不足なら`BLOCKED`。不測の強制終了では結果を`UNKNOWN`として扱う。
+- **Verdict優先順位**：Cleanup／独立readback／Host保全の異常=`CLEANUP_FAILED`が常に最優先。次にIdentity不一致・権限不足・command失敗・DROP証拠不足=`BLOCKED`。全条件確認済みの場合だけ`KERNEL_CAPABILITY_PASS`。Job未実行=`NOT_RUN`、強制終了で最終結果未確定=`UNKNOWN`（いずれもPASSではない）。
 - Issue #9 `LEGACY_RESULT_UNKNOWN`を維持。Stage 1固定候補CLI、Journal、OwnerApproval、既存Runnerの実行経路を変更しない。
 - 設計採択はコード変更、GitHub commit/push/PR、Workflow起動、外部サービス書込みの許可ではない。各実行許可は別Checkpointで取得する。
 - Review Loop Prevention：限定テストと必要な局所訂正を行ったらOwner判断へ。機械的な独立レビュー連鎖を作らない。
 
 ## Review Focus
 
-1. **Namespace作成失敗**：Hostのroute／ip_forward変更なし、作成済み対象があれば削除、`BLOCKED`で終了する（Task 1の`test_namespace_create_failure`）。
-2. **nftables拒否／DROPの実効性欠如**：安全成功にしない。ローカルveth宛の試験パケットがDROP counterを増加させなければ`BLOCKED`（Task 1の`test_nft_drop_counter_not_incremented`）。
-3. **Cleanup失敗**：失敗時にも後続対象の除去を試み、残留を再照合して`CLEANUP_FAILED`優先（Task 1の`test_cleanup_failure_overrides_capability_pass`）。
-4. **RunnerへのSecrets混入**：Workflowの特権起動環境がallowlistだけであることを検査（Task 2の`test_workflow_does_not_pass_secrets`）。
-5. **予期しない自動起動**：Workflowのtriggerは`workflow_dispatch`だけ（Task 2の`test_workflow_only_manual_dispatch`）。
+1. **実行Identity不一致**：未承認Ref、Source Commit、Smoke blob不一致はsudo起動0件で`BLOCKED`（Task 2の`test_workflow_rejects_unapproved_ref_or_source_identity`）。
+2. **Namespace衝突・生成成否不明**：他者のResourceを削除せず、OwnedだけCleanup。不確実残留は`CLEANUP_FAILED`（Task 1の`test_preexisting_name_collision_never_deleted`、`test_ambiguous_creation_not_deleted`）。
+3. **DROP実効性なし**：ruleの`counter drop`・before/after・宛先route・単発UDPを確認できなければ`BLOCKED`（Task 1の`test_nft_drop_counter_not_incremented`）。
+4. **CleanupまたはHost保全失敗**：他の成功より`CLEANUP_FAILED`が優先。後続Owned対象もCleanupする（Task 1の`test_cleanup_failure_overrides_capability_pass`）。
+5. **Workflow権限・起動拡大**：Secretsを特権環境に渡さず、起動は`workflow_dispatch`のみ（Task 2の`test_workflow_does_not_pass_secrets`、`test_workflow_only_manual_dispatch`）。
 
 ---
 
@@ -40,7 +48,7 @@
 - **Create** `tests/test_gha_isolation_feasibility.py` — 実カーネルやネットワークを操作しないモック単体テスト。
 - **Create** `.github/workflows/gha-isolation-feasibility.yml` — `workflow_dispatch`限定の手動Workflow。既存WorkerデプロイWorkflowとは分離。
 - **Create** `tests/test_gha_isolation_workflow.py` — Workflowの起動経路・権限・Secrets非使用などの静的契約テスト。YAMLパーサーの新規依存は増やさず、対象Workflowの固定テンプレートとキーを精密に検査する。
-- **Copy adopted spec** `docs/superpowers/specs/2026-11-23-vpn-orbit-zero-cost-tokyo-automation-design.md` — 採択済みR0.1。現行ソースへの書込みは未承認。
+- **Reference existing adopted spec** `docs/superpowers/specs/2026-11-23-vpn-orbit-zero-cost-tokyo-automation-design.md` — 対象featureブランチへ追加済み。master未反映・実装未承認。
 - **This plan's target** `docs/superpowers/plans/2026-11-23-vpn-orbit-gha-isolation-feasibility-implementation-plan.md`。
 - **Do not modify** `vpn_orbit/stage1_fixed_probe.py`、`vpn_orbit/attempt_journal.py`、既存`worker/`、既存Workflow。
 
@@ -51,29 +59,35 @@
 - Test: `tests/test_gha_isolation_feasibility.py`
 
 **Interfaces:**
-- `SmokeVerdict`: 状態 `KERNEL_CAPABILITY_PASS | BLOCKED | CLEANUP_FAILED | UNKNOWN`、固定理由コード配列、Namespace/TUN/nft/route/cleanupの個別判定を持つ値型。
-- `CommandRunner.run(argv: tuple[str, ...], *, timeout_s: float) -> CommandResult`：許可されたコマンドだけを実行する注入可能な実行境界。テストはFakeRunnerを利用。
-- `run_smoke(runner: CommandRunner, *, scope: str) -> SmokeVerdict`：限定Namespace、veth、TUN、nftablesで能力検証し、必ずreadbackして返す。`scope`はASCII英数字の短い固定安全名のみ許可。
-- `main() -> int`：結果を固定キーのJSON1件だけ出力。PASS時のみ0、それ以外は非0。
+- `CommandResult`（frozen dataclass）：`argv: tuple[str, ...]`、`returncode: int | None`、`stdout: str`、`stderr: str`、`timed_out: bool`、`spawn_failed: bool`。タイムアウト／起動失敗なら`returncode=None`、`stdout`/`stderr`は上限内の診断用内部値（外部に生出力禁止）。上限超過は成功ではない。戻り値の非0・`None`を正常値に変換しない。
+- `CommandRunner.run(argv: tuple[str, ...], *, timeout_s: float) -> CommandResult`：唯一のOS command境界。許可された絶対パスと固定argv文法だけを許容し、`shell=False`、固定allowlist env、5秒上限、stdout/stderr各4096 bytes上限、timeout時の子プロセス群回収を強制。拒否されたargvは**OS起動0件で`CommandRejected`例外**、`run_smoke`が固定Reason Codeの`BLOCKED`に変換する。FakeRunnerも同一`CommandResult`型を返す。
+- `SmokeVerdict`（frozen dataclass）：`verdict: Literal["KERNEL_CAPABILITY_PASS", "BLOCKED", "CLEANUP_FAILED", "UNKNOWN"]`、`reason_codes: tuple[str, ...]`、`checks: dict[str, Literal["PASS", "BLOCKED", "NOT_RUN", "UNKNOWN"]]`。`checks`のキーは`namespace`,`veth`,`tun`,`nft_drop`,`host_route`,`ip_forward`,`cleanup`に固定。理由コードは`IDENTITY_MISMATCH`,`PREREQUISITE_MISSING`,`RESOURCE_COLLISION`,`OWNERSHIP_AMBIGUOUS`,`COMMAND_FAILED`,`COMMAND_TIMEOUT`,`OUTPUT_LIMIT`,`DROP_UNVERIFIED`,`CLEANUP_INCOMPLETE`,`HOST_STATE_CHANGED`から選択し、生例外を露出しない。
+- `run_smoke(runner: CommandRunner, *, scope: str) -> SmokeVerdict`：`scope`は`^[a-z0-9]{1,8}$`。承認済み前提で2つの閉じた一時Namespace、専用veth、TUN、専用nftを検証し、作成成功確認済みの所有対象だけCleanup、最後に独立readback。Cleanup失敗を最優先。
+- `main() -> int`：CLI引数なしで**固定`scope="gha"`**を渡し、`{ "verdict": str, "reason_codes": [str], "checks": {<固定7キー>: str} }`のJSON1件だけ出力。追加引数は実行前`BLOCKED`。PASS時のみ0、それ以外は非0。Workflow/Identity gateの`NOT_RUN`はSmoke内部のVerdictではなく実行前状態。
 
 - [ ] **Step 1: Write failing tests** in `tests/test_gha_isolation_feasibility.py`。テスト名と期待値：
   - `test_safe_scope_rejects_shell_metacharacters`：不正scopeで実行コマンド0件、`BLOCKED`。
-  - `test_namespace_create_failure`：Namespace生成拒否で`BLOCKED`、既存Host route変更0回。
-  - `test_tun_missing_or_creation_denied`：`/dev/net/tun`欠落またはTUN作成拒否で`BLOCKED`、Cleanup実施。
-  - `test_nft_drop_counter_not_incremented`：DROPカウンタ非増加で`BLOCKED`。
-  - `test_cleanup_failure_overrides_capability_pass`：能力確認PASSでも残留readbackなら`CLEANUP_FAILED`。
-  - `test_no_vpn_or_external_network_command`：OpenVPN、curl、GET、外部宛通信を要求せず、Host default route/`ip_forward`への書込みをしない。
-  - `test_success_requires_cleanup_and_route_unchanged`：すべて通過し、Host default routeの前後一致、Namespace・veth消失なら`KERNEL_CAPABILITY_PASS`。
-  - `test_main_redacts_errors_and_uses_fixed_schema`：例外や環境値をログに露出せず、意図したJSONキーだけ出力。
+  - `test_command_result_fields_and_rejects_unapproved_argv`：`CommandResult`の6フィールドと固定argv構文。不許可パス・shell・引数変更は実行0件で`BLOCKED`。
+  - `test_command_timeout_nonzero_and_output_limit_block`：timeout/非0/4096 bytes超過は`BLOCKED`、Owned Cleanup継続。
+  - `test_namespace_create_failure`：Namespace生成拒否で`BLOCKED`、作成済みOwnedだけCleanup、Host route変更0回。
+  - `test_preexisting_name_collision_never_deleted`：衝突した既存Namespace/Link/Tableの削除コマンド0件、`BLOCKED`。
+  - `test_ambiguous_creation_not_deleted`：作成の成否不明では未確認の実体を消さず、readback残留は`CLEANUP_FAILED`。
+  - `test_tun_missing_or_creation_denied`：`/dev/net/tun`欠落またはTUN作成拒否で`BLOCKED`、Owned Cleanup実施。
+  - `test_nft_rule_definition_and_counter_delta_one`：`inet vof_<nonce> out`のhook/output/priority/policy/`counter drop`が一致し、送信側UDP/9 1件でcounter差分が正確に1、bytes増加、専用veth routeを確認して初めてDROP=`PASS`。
+  - `test_nft_drop_counter_not_incremented`：counter差分0、読み取れないcounter、drop文言不足、宛先route不一致、送信失敗のいずれも`BLOCKED`。
+  - `test_cleanup_failure_overrides_capability_pass`：一部Cleanup失敗後も他のOwnedを処理、Host route/`ip_forward`差分または残留があれば`CLEANUP_FAILED`。
+  - `test_no_vpn_or_external_network_command`：OpenVPN、curl、GET、外部宛通信、Host route/`ip_forward`やHost Firewall変更のargvが一件もない。
+  - `test_success_requires_cleanup_and_route_unchanged`：全readback通過、Host IPv4 route全体/`ip_forward`不変、全Namespace/Link/Table不在なら`KERNEL_CAPABILITY_PASS`。
+  - `test_main_redacts_errors_and_uses_fixed_schema`：例外や環境値をログに露出せず、固定JSON3キーのみ出力。
 - [ ] **Step 2: Run tests expecting RED**: `python3 -m unittest tests.test_gha_isolation_feasibility -v`。期待：未実装の公開インターフェースに関するFAIL/ERROR。
 - [ ] **Step 3: Implement minimal smoke**：以下の順序を守る。
-  1. root/`sudo`、`ip`、`nft`、`/dev/net/tun`、Kernel version、Host IPv4 default routeと`ip_forward`の読み取り専用Snapshot。
-  2. 実行IDに紐づく衝突不能な一時Namespace・vethを作成。既存リソースに名前衝突したら触らず停止。
-  3. vethはHostとNamespaceをローカルの小さな専用Subnetで接続するが、Host WAN forwarding/routeは追加せず、Namespaceにdefault routeを追加しない。
-  4. Namespace内にTUN interfaceを作成してreadbackする。OpenVPN起動なし。
-  5. Namespace内にnftables OUTPUT DROPを作り、**専用veth peerだけ**に対するローカル試験パケットでカウンタ増加を確認。外部ネットワークへ通信しない。
-  6. finallyで作成したNamespace・veth・nft・TUNを可能な範囲で撤去。Host route/`ip_forward`の前後一致とリソース不在を独立readback。Cleanup異常は合否に優先。
-  7. 一時的なLinux操作が失敗しても候補試験や他のJobへ進まない。例外文字列をstdout/stderrへ投影しない。
+  1. root、固定絶対パスの`ip`/`nft`/Python、`/dev/net/tun`、Kernel version、Host IPv4 route**全体**と`ip_forward`をread-only snapshot。コマンドallowlistと`CommandResult`で失敗を判定。
+  2. nonceを生成し2つのNamespace名・専用veth/表名の不存在をreadback。衝突なら停止（既存の削除なし）。`ip netns add <tx>`、`ip netns add <rx>`、**tx Namespace内**でvethを作り片側をrxへ移動。作成後の状態とpeer対応をreadbackした対象だけOwnedに記録。
+  3. 専用`198.18.0.1/30`（tx）と`198.18.0.2/30`（rx）を各vethに割り当てup。Namespaceにdefault routeなし。HostへInterface/IP/route/firewallを追加せず、Hostのrouting/ip_forwardを変更しない。
+  4. tx Namespace内の`voftun0` TUNを作り、readback。OpenVPNは起動しない。
+  5. tx Namespaceの`inet vof_<nonce> out` chainを`filter/output/priority 0/policy accept`で作成、宛先rx `198.18.0.2`/UDP9への`counter drop`のみを登録。ルールの構造とbefore.packets=0をJSON readbackし、rx宛routeがtx vethであることを確認。tx Namespace内から固定3 bytesのUDP1回だけ送信した後、同じruleのafter.packets−before.packets=1かつbytes増加を確認。測定不能・不一致は`BLOCKED`。
+  6. 正常・部分失敗ともfinallyで**Owned確認済み**のnft/TUN/veth/Namespaceを逆順Cleanup。他者または所有不明の実体は削除しない。失敗しても後続Owned Cleanup継続。最後に別のreadbackで残留不在、Host route全体と`ip_forward`の完全一致を確認。残留・不変性未確認・cleanup失敗なら`CLEANUP_FAILED`が優先。
+  7. `CommandRunner`は各コマンド5秒以内、単発Smoke90秒以内、外部通信なし。異常終了の生例外・stderrを出力せず固定Reason CodeとChecksだけ出す。`KERNEL_CAPABILITY_PASS`は独立readbackを含む全条件PASS時のみ。
 - [ ] **Step 4: Run GREEN**：`python3 -m unittest tests.test_gha_isolation_feasibility -v`、`python3 -m compileall -q vpn_orbit tests`、`git diff --check`。すべて成功でTask 1の実装準備完了。これは**実RunnerのPASSではない**。
 - [ ] **Step 5: Commit only after separate Owner authorization**。コード変更は専用feature branchで管理し、既存`master`を直接変更しない。承認されるまでCommit/Pushしない。
 
@@ -84,19 +98,23 @@
 - Test: `tests/test_gha_isolation_workflow.py`
 
 **Interfaces:**
-- Consumes: Task 1の`python3 -m vpn_orbit.gha_isolation_feasibility`と`SmokeVerdict`。
-- Produces: `workflow_dispatch`でのみ1回起動できるJob（`runs-on: ubuntu-latest`）、赤字の非PASS時はJob FAILURE、全条件PASSでも出力するのはKernel Capabilityの限定PASSだけ。
+- Consumes: Task 1の`SmokeVerdict`と、独立してIdentityを検証した`vpn_orbit/gha_isolation_feasibility.py`（`/usr/bin/python3 -I <承認済みcheckoutの絶対パス>`で直接起動。`-m`や任意`PYTHONPATH`経由の未確認importは不可）。
+- Produces: `workflow_dispatch`専用Job（`runs-on: ubuntu-latest`）、Ref/HEAD/Smoke blob照合を**sudoより先に**実施。`KERNEL_CAPABILITY_PASS`以外はJob FAILURE。Owner承認のないRefは即時停止。
 
 - [ ] **Step 1: Write failing workflow contract tests**：
   - `test_workflow_only_manual_dispatch`：`on`に`workflow_dispatch`のみ。Cron、push、pull_request、pull_request_target、workflow_runなし。
   - `test_workflow_readonly_token_and_no_persisted_checkout_credentials`：`permissions: contents: read`およびcheckoutの`persist-credentials: false`。
   - `test_workflow_does_not_pass_secrets`：`secrets`、`vars`、Cloudflare/GitHub token環境注入、artifact upload、publisher stepなし。
   - `test_workflow_uses_standard_runner_and_bounded_single_job`：`ubuntu-latest`標準Runner、`timeout-minutes: 10`、`concurrency`設定、`cancel-in-progress: false`。
-  - `test_workflow_root_process_has_minimal_environment`：`sudo env -i`等で実行プロセスへの環境変数をallowlistに限定し、固定パスからModule実行。
+  - `test_workflow_root_process_has_minimal_environment`：`sudo env -i`で`PATH`、`LANG`、`LC_ALL`だけを許可し、検証済み絶対パスの単独Pythonを`-I`で実行。`PYTHONPATH`、任意module importなし。
+  - `test_workflow_rejects_unapproved_ref_or_source_identity`：未承認`github.ref`、`github.sha`/Workflow checkout HEAD不一致、source checkout HEADとOwner承認フルSHA不一致、Smoke Git blob SHA不一致時はsudo実行0件・Job FAILED。
+  - `test_workflow_identity_checks_precede_privileged_code`：固定Identity readbackがoffline testより前、必ずsudoより前。`actions/checkout@SHA`はActionのみをpinし、対象Code SHA/Blobを別途確認。
+  - `test_workflow_does_not_add_inputs_or_write_external_state`：追加`workflow_dispatch.inputs`なし、workflow_runなし、Cloudflare/API token/Artifactへ書込みなし。
 - [ ] **Step 2: Run expecting RED**：`python3 -m unittest tests.test_gha_isolation_workflow -v`。期待：Workflow未実装のFAIL。
 - [ ] **Step 3: Implement Workflow**：
-  - `workflow_dispatch`のみ。追加の入力なし。`ubuntu-latest`上で通常checkout（verified full SHA pin、`persist-credentials: false`）。
-  - 最初にPythonのオフラインunit test、次に`sudo env -i PATH=... LANG=C PYTHONPATH=... /usr/bin/python3 -m vpn_orbit.gha_isolation_feasibility`。Runnerに必要コマンド・Pythonが不足する場合はBLOCKEDで停止し、暗黙の`apt install`を行わない。
+  - `workflow_dispatch`のみ、inputsなし。`ubuntu-latest`標準Jobで`actions/checkout`の**Action自体**を検証済みフルSHA固定、`persist-credentials: false`。Workflowは予めOwner承認された`dispatch_ref`からのみ起動し、`github.ref`の一致とWorkflow側checkout HEAD=`github.sha`を確認。
+  - SourceはWorkflow定義Commitとは区別し、Owner承認済み`code_commit_sha`（フル40桁）を明示してcheckout。`git rev-parse HEAD`とSmokeの`git hash-object`が承認済みSHA/Blobに一致しなければ**一切のテスト・sudo実行をしない**。`code_commit_sha`/blob期待値はOwner承認後にWorkflowへ固定し、Workflow定義のCommit自体は**Dispatch直前のOwner readback**で別途承認する（自己SHAのYAML内埋込みをしない）。固定Identityの承認済み値が揃わない段階ではDispatch HOLD。
+  - Identity全PASS後、オフラインunit testsを実行。続いて`sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /usr/bin/python3 -I <検証済み絶対パス>/vpn_orbit/gha_isolation_feasibility.py`。OS commandはTask 1の限定allowlistだけ。Python/Kernel command不足なら`BLOCKED`で停止し、暗黙の`apt install`なし。
   - `GITHUB_TOKEN`はcheckout用最小権限に限定し、特権プロセスへ継承しない。Secretsは使用しない。
   - JSONの固定結果をconsoleに出し、非PASS時にJob FAILURE。Artifact、キャッシュ、公開Profile、KV書込みは作成しない。
   - Default branchにWorkflowが存在するまで`workflow_dispatch`が利用できない制約を文書に明記し、承認なしにマージ・dispatchしない。
@@ -110,9 +128,9 @@
 
 ## Owner Checkpoint: One bounded GitHub-hosted Kernel Test
 
-**Preparation complete when:** Task 1/2のOffline Tests PASS、固定HEADとWorkflow差分・secret absence確認、同じ採択済みSpecがリポジトリに存在し、Ownerがコード差分と実行範囲を読める状態。
+**Preparation complete when:** Task 1/2のOffline Tests PASS、`(workflow_definition_commit_sha, workflow_blob_sha, dispatch_ref, code_commit_sha, smoke_blob_sha)`が全て確定し、OwnerがWorkflow定義の実行Ref/HEADとCode IdentityをGitHub readbackで照合可能な状態。Spec R0.1は既にfeatureブランチに存在、master未反映。Workflowファイルの自己Commit SHAを同一ファイルへ固定する循環は許容しない。Owner readbackによるWorkflow定義Identityの確認ができない場合は特権実行せずSTOP。
 
-**Owner must separately authorize:** Feature PR/mergeおよび`workflow_dispatch`1回。安全要件を満たさず`workflow_dispatch`を可能にできない場合は**STOP**、未承認triggerを追加しない。
+**Owner must separately authorize:** Source／Workflow各Commit、Feature PR/merge、および承認した`dispatch_ref`・Workflow定義SHAでの`workflow_dispatch`1回。承認Refが移動していた場合は実行せず停止し、新Refの採用やSHA更新を自動で承認しない。安全要件を満たさず`workflow_dispatch`を可能にできない場合は**STOP**、未承認triggerを追加しない。
 
 **Live execution here means Kernel smoke only**（Namespace／veth／TUN／nftables作成、ローカル試験パケット、Cleanup）。VPN Gate/OpenVPN/GeoIP/Cloudflare通信や実接続は禁止。
 
@@ -129,6 +147,6 @@
 
 - 仕様R0.1の順序1（GitHub-hosted隔離成立性）だけをこの計画の対象とした。残る自動検証Runner／Pool／Publisher／iOS実機E2Eは**本計画には含まれず、未承認**。
 - ファイル責務はSmoke本体、unit tests、manual Workflow、workflow testsに限定した。
-- テストはNamespace・nft・Cleanup・資格情報・triggerの5つの主な失敗条件をカバーする。
+- テストはIdentity・namespace衝突/所有・DROP実効性・Cleanup・Workflow権限/triggerの5つの主な失敗条件をカバーする。
 - 外部からの通知や秘密情報、Profile発行、Cloudflare変更に依存しない。
 - 完了時は`KERNEL_CAPABILITY_PASS`か明確な停止理由を報告してこのTaskを終了。独立レビュー・追加Taskは自動起動しない。
