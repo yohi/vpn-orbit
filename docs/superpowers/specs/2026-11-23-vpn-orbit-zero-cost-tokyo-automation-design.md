@@ -1,6 +1,6 @@
 # VPN-ORBIT — Zero-Cost Automated Tokyo VPN Design R0.1
 
-**状態：Human Owner ADOPTED（2026-11-23、会話内で承認）／Repositoryには未反映**
+**状態：Design R0.1 Human Owner ADOPTED（2026-11-23）／feature/vpn-orbit-gha-isolation-feasibility-design-20261123に追加済み（master未反映）／実装・GitHub Actions DispatchはHOLD**
 
 ## 1. 目的
 
@@ -52,6 +52,16 @@ OpenVPNプロセスにCloudflare認証情報、GitHub書込み権限、Publisher
 検証Jobと配信Jobの権限を分離する。検証証拠にはProfile原文・秘密鍵を含めず、配信前に候補のProfile Identityを再照合する。
 
 Cleanup不完全、隔離不成立、権限逸脱を検出した場合は、そのバッチ全体を停止する。
+
+### 初回Kernel Capability Smokeの限定安全契約（実通信なし）
+
+- **実行Identity（F-001）**：Owner承認記録に、Workflow定義の完全Commit SHA／WorkflowファイルIdentity、Dispatch Ref、checkout対象の実行コードCommit SHA、Smoke PythonファイルのGit blob SHAを固定する。実行コードCommitとWorkflow定義Commitは区別する。実行コードはPython標準ライブラリ以外のリポジトリ内コードを特権importしない単独ファイルとし、ファイルIdentity照合に含まれない特権コードを実行しない。
+- **Dispatch／特権起動前ゲート**：Ownerは実行前にDispatch Refの指すWorkflow定義Commitが承認済みと一致することをreadbackする。JobはRefの許可リスト一致、`github.sha`とcheckout済みWorkflow側HEADの一致、および別途SHA固定した実行コードCommitのHEADとSmoke blob SHAの一致を、sudo起動前にすべて検査する。GitHub workflow定義の自己Commit SHAは同一YAMLに埋め込めないため、**OwnerのDispatch直前確認は機械検証の代替ではなく必須の独立ゲート**とする。照合できない／不一致なら起動せず`BLOCKED`。`actions/checkout@<full SHA>`はAction自体のIdentityであり、checkoutされたコードのIdentityを証明しない。Workflow入力や外部書込みを増やさない。
+- **実行境界（F-002）**：`CommandRunner.run(argv: tuple[str, ...], *, timeout_s: float) -> CommandResult`を唯一のOSコマンド経路とし、`shell=False`、絶対パス、最小環境allowlist、引数ごとの固定許可構文、各コマンドタイムアウトを強制する。`CommandResult`は`argv`／`returncode`／`stdout`／`stderr`／`timed_out`／`spawn_failed`を持つ。非0終了・タイムアウト・出力過大・不許可argvは成功に変換しない。具体的な許可構文・上限は同一採択Specに対応する実装Planに固定する。
+- **リソースの所有とCleanup（F-002）**：衝突しない実行nonceから生成した**送信／受信2つの一時Namespace**および専用veth、Namespace内TUNとnftテーブルだけを対象とする。事前の不存在、作成コマンド成功、期待する実体のreadbackが揃ったものだけを所有済みとする。既存・所有不明・作成成否不明の実体は削除せず、`CLEANUP_FAILED`または`BLOCKED`として停止。部分失敗時も所有確認済みの対象を逆順Cleanupし、最後に独立readbackで不存在とHost route／`ip_forward`不変を確認する。`CLEANUP_FAILED`はCapability成功より優先する。
+- **DROPの実効性（F-003）**：送信Namespace内の`nft inet vof_<nonce> out`（`type filter hook output priority 0; policy accept`）に、受信側専用veth IPv4への**UDP/9 `counter drop`**を明示する。試験は外部宛ではなく、送信Namespaceから受信Namespaceの専用veth宛へ**UDP datagram 1件だけ**送る。前後の同一ルールcounterについて`after.packets - before.packets == 1`、ルールの`counter drop`読戻し、専用veth宛routeを確認する。いずれか未確認・未増加・不一致なら`BLOCKED`とし、Host既存Firewall／外部ネットワークは変更しない。
+
+この限定SmokeはLinux Kernel能力のみを判断するもので、OpenVPN・東京出口・継続運用のPASSを意味しない。実行には別途OwnerのWorkflow定義・対象Commit・Dispatch承認が必要。
 
 ## 5. Verified PoolとWorker配信
 
