@@ -32,6 +32,20 @@ class DropEvidenceTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(marker, "direct_drop_counter_verified")
 
+    def test_empty_iproute_flags_array_is_accepted(self):
+        self.commands.original_route_record["flags"] = []
+        self.commands.current_route_record = self.commands.original_route_record.copy()
+        ok, marker = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
+        self.assertTrue(ok)
+        self.assertEqual(marker, "direct_drop_counter_verified")
+
+    def test_nonempty_iproute_flags_array_is_rejected(self):
+        self.commands.original_route_record["flags"] = ["onlink"]
+        self.commands.current_route_record = self.commands.original_route_record.copy()
+        ok, reason = self.runner.host_direct_route_rejected("1.1.1.1", self.r, self.r.deadline)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "drop_route_unavailable")
+
     def test_failed_initial_route_query_returns_route_unavailable(self):
         original_run = self.commands.run
 

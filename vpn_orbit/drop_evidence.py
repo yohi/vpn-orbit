@@ -21,7 +21,7 @@ class DropEvidenceAttempt:
         resources = self.resources
         echo_ip = self.echo_ip
         route = echo_ip + "/32"
-        original_route_record: dict[str, str | int] | None = None
+        original_route_record: dict[str, str | int | list[str]] | None = None
         drop_rule_installed = False
         drop_handle: int | None = None
         counter_before: int | None = None
@@ -38,13 +38,15 @@ class DropEvidenceAttempt:
                 reason = "drop_route_unavailable"
             else:
                 route_record = route_rows[0]
-                allowed_fields = {"dst", "dev", "scope", "protocol", "metric", "prefsrc", "table", "type"}
+                allowed_fields = {"dst", "dev", "scope", "protocol", "metric", "prefsrc", "table", "type", "flags"}
                 valid_attributes = (
                     route_record.get("dst") in (route, echo_ip) and
                     route_record.get("dev") == "tun0" and
                     "gateway" not in route_record and
                     set(route_record).issubset(allowed_fields)
                 )
+                if "flags" in route_record:
+                    valid_attributes = valid_attributes and route_record["flags"] == []
                 for field_name in ("scope", "protocol", "table", "type"):
                     if field_name in route_record:
                         attribute = route_record[field_name]

@@ -73,7 +73,7 @@ class RecordingCommands(Commands):
                 return subprocess.CompletedProcess(args, 1, "", "")
             route_index = args.index("route")
             destination_index = route_index + 2
-            parsed_route: dict[str, str | int] = {"dst": args[destination_index]}
+            parsed_route: dict[str, str | int | list[str]] = {"dst": args[destination_index], "flags": []}
             if parsed_route["dst"] == "unicast":
                 parsed_route["type"] = "unicast"
                 destination_index += 1
