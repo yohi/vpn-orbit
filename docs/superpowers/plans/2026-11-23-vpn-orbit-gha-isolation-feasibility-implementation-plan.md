@@ -23,8 +23,8 @@
 - Shellの`set -x`を使用せず、出力は固定コード、Python／Kernel version、合否、許可済み一時リソース名とcleanup結果のみ。`env`、secret、Profile原文、Client Key、例外stacktraceは出力しない。
 - **限定OS実行 F-002**：絶対パス`/usr/sbin/ip`、`/usr/sbin/nft`、`/usr/bin/python3`だけ（名前空間内の固定UDP送信コードのみ）を許可し、実行前に`os.geteuid()==0`を確認。`CommandRunner.run()`のみ、`shell=False`、固定`env={"PATH":"/usr/sbin:/usr/bin:/sbin:/bin","LANG":"C","LC_ALL":"C"}`、`cwd="/"`、stdin閉鎖、stdout/stderr各4096 bytes上限、コマンドごと`0 < timeout_s <= 5.0`、Smoke全体90秒上限、timeout時は実行プロセス群kill/wait。非0、起動失敗、超過出力、timeoutは`BLOCKED`とし、Cleanupは別の有界deadlineで試す。raw stderrや例外・環境情報はstdoutへ出さない。
 - **一時リソース F-002**：`scope`は`^[a-z0-9]{1,8}$`、nonceは`secrets.token_hex(4)`の8文字小文字hex。Namespaceは`vof-<scope>-<nonce>-tx`/`-rx`、専用veth名は`vt<nonce>`/`vr<nonce>`、TUN名`voftun0`、nftは**送信Namespace内**の`inet vof_<nonce> out`だけ。Namespaceを2つ作りveth両端を各Namespaceに配置するため、Hostにveth・IP・経路・Firewallを追加しない。両Namespaceにdefault routeを置かない。テスト専用IPv4は`198.18.0.1/30`（送信側）と`198.18.0.2/30`（受信側）のみ。
-- **所有・競合 F-002**：作成前にNamespace名・Link名・nft名の不存在をreadbackし、衝突時は未所有実体に触れず`BLOCKED`。`owned`集合へ入れるのは当該作成がexit 0で完了し、直後readbackで名前・所属Namespace・専用peer等の一致を確認した対象のみ。タイムアウト／出力不明／readback不成立で所有不明の対象は消さず、不確実な残留として`CLEANUP_FAILED`。作成済み他リソースは逆順でCleanup試行し、各失敗後も後続対象を試す。Cleanup完了後、Host IPv4 route全体と`ip_forward`の前後一致、許可済み一時Namespace・veth・TUN・nftの不存在を**独立readback**。未確認・残留・Host状態変化は`CLEANUP_FAILED`優先（CapabilityをPASSにしない）。
-- **許可argv F-002**：`/usr/sbin/ip`の`-j -4 route show`／`netns list`／`netns add|del <owned_ns>`／`-n <owned_ns> link add|set|show|del`（作成したveth・TUNだけ）／`-n <owned_ns> addr add|show`（専用アドレスだけ）／`-n <owned_ns> route get 198.18.0.2`／`-n <owned_ns> tuntap add|del dev voftun0 mode tun`、`ip netns exec <owned_tx_ns> /usr/sbin/nft ...`（下記固定テーブル・チェーン・ルールのadd/list/deleteだけ）、`ip netns exec <owned_tx_ns> /usr/bin/python3 -I -S -c <固定UDP送信コード定数>`のみ。`-c`引数は単一の承認済み固定コード定数との完全一致だけを許容し、未承認のimport・引数変更を禁止する。引数はトークン単位で許可構文と照合する。`sh`/`bash`、`curl`、`openvpn`、apt、外部IP宛接続、任意コマンド、Host route/`ip_forward`変更、Host nft変更は許可しない。
+- **所有・競合 F-002**：Namespace名・Link名・nft名の**作成前不存在**をreadbackし、衝突時は未所有実体に触れず`BLOCKED`。`planned_ns`は生成nonceと事前不存在確認で**作成を許された名前集合**であり、所有権の証拠ではない。`ip netns add`は`planned_ns`に属する名前に限る。作成コマンドのexit 0と直後の名前・所属・専用実体readbackが成功した時だけ、その名前を`owned_ns`へ遷移させる。`ip netns del`は`owned_ns`だけに許可する。作成失敗時に不存在が確証された場合は`BLOCKED`、成否不明・readback不成立・他者所有が疑われる場合は削除せず、残留または不存在未確認なら`CLEANUP_FAILED`とする。他者・未所有Resourceの削除は禁止。Namespace以外の`owned`も作成成功と実体readbackの両方で確定させる。作成済み所有対象は逆順でCleanupし、失敗後も残りの所有対象に対してCleanupを試行する。**Host初期snapshotとCleanup後の独立readbackは同一の`/usr/sbin/ip -j -4 route show table all`を使い、全IPv4 routing tableを比較する**。両方の結果はexit 0かつ有効なJSONであることを要求し、比較不能・取得不能・不正JSONはPASSとしない。初期snapshot失敗は`BLOCKED`、Cleanup後のreadback不成立・route差分・`ip_forward`差分・許可済み一時Resourceの残留は`CLEANUP_FAILED`を優先する。
+- **許可argv F-002**：`/usr/sbin/ip`の`-j -4 route show table all`／`netns list`／`netns add <planned_ns>`／`netns del <owned_ns>`／`-n <owned_ns> link add|set|show|del`（作成したveth・TUNだけ）／`-n <owned_ns> addr add|show`（専用アドレスだけ）／`-n <owned_ns> route get 198.18.0.2`／`-n <owned_ns> tuntap add|del dev voftun0 mode tun`、`ip netns exec <owned_tx_ns> /usr/sbin/nft ...`（下記固定テーブル・チェーン・ルールのadd/list/deleteだけ）、`ip netns exec <owned_tx_ns> /usr/bin/python3 -I -S -c <固定UDP送信コード定数>`のみ。`-c`引数は単一の承認済み固定コード定数との完全一致だけを許容し、未承認のimport・引数変更を禁止する。引数はトークン単位で許可構文と照合する。`sh`/`bash`、`curl`、`openvpn`、apt、外部IP宛接続、任意コマンド、Host route/`ip_forward`変更、Host nft変更は許可しない。
 - **DROP F-003**：送信Namespaceの`nft add table inet vof_<nonce>`、`add chain inet vof_<nonce> out { type filter hook output priority 0; policy accept; }`、`add rule inet vof_<nonce> out oifname vt<nonce> ip daddr 198.18.0.2 udp dport 9 counter drop`（順序・要素固定）を許可。`nft -j list chain inet vof_<nonce> out`から対象ルールの構文、counter packets/bytes、hook等をreadbackし、試験前`before.packets == 0`、送信Namespaceから受信専用vethへ単発UDP（ポート9、payloadは固定3 bytes）、試験後`after.packets - before.packets == 1`かつ`after.bytes > before.bytes`を要求する。送信前にRouteが専用vethに限定されdefault route不在であることを確認。Counter不変・解析不能・ルール不一致・送信失敗は`BLOCKED`。送信成功だけでDROP成功と扱わない。
 - 非Network操作の能力確認でも、操作は実行前に許可された一時リソース名だけ。既存プロセス／Firewall／routeには触れない。
 - **Verdict優先順位**：Cleanup／独立readback／Host保全の異常=`CLEANUP_FAILED`が常に最優先。次にIdentity不一致・権限不足・command失敗・DROP証拠不足=`BLOCKED`。全条件確認済みの場合だけ`KERNEL_CAPABILITY_PASS`。Job未実行=`NOT_RUN`、強制終了で最終結果未確定=`UNKNOWN`（いずれもPASSではない）。
@@ -35,9 +35,9 @@
 ## Review Focus
 
 1. **実行Identity不一致**：未承認Ref、Source Commit、Smoke blob不一致はsudo起動0件で`BLOCKED`（Task 2の`test_workflow_rejects_unapproved_ref_or_source_identity`）。
-2. **Namespace衝突・生成成否不明**：他者のResourceを削除せず、OwnedだけCleanup。不確実残留は`CLEANUP_FAILED`（Task 1の`test_preexisting_name_collision_never_deleted`、`test_ambiguous_creation_not_deleted`）。
+2. **Namespace衝突・生成成否不明**：事前不存在の`planned_ns`に限り生成し、作成exit 0＋readback後の`owned_ns`だけ削除。他者・未所有Resourceを削除せず、不確実残留は`CLEANUP_FAILED`（Task 1の`test_planned_ns_add_allowed_before_ownership`、`test_netns_del_requires_confirmed_owned_ns`、`test_preexisting_name_collision_never_deleted`、`test_ambiguous_creation_not_deleted`）。
 3. **DROP実効性なし**：ruleの`counter drop`・before/after・宛先route・単発UDPを確認できなければ`BLOCKED`（Task 1の`test_nft_drop_counter_not_incremented`）。
-4. **CleanupまたはHost保全失敗**：他の成功より`CLEANUP_FAILED`が優先。後続Owned対象もCleanupする（Task 1の`test_cleanup_failure_overrides_capability_pass`）。
+4. **CleanupまたはHost保全失敗**：初期と最終の`ip -j -4 route show table all`を使った全IPv4 routing table比較を必須とし、最終readbackの取得・JSON・比較失敗も`CLEANUP_FAILED`を優先。後続Owned対象もCleanupする（Task 1の`test_host_ipv4_route_snapshot_all_tables`、`test_cleanup_route_readback_failure_is_cleanup_failed`、`test_cleanup_failure_overrides_capability_pass`）。
 5. **Workflow権限・起動拡大**：Secretsを特権環境に渡さず、起動は`workflow_dispatch`のみ（Task 2の`test_workflow_does_not_pass_secrets`、`test_workflow_only_manual_dispatch`）。
 
 ---
@@ -67,26 +67,31 @@
 
 - [ ] **Step 1: Write failing tests** in `tests/test_gha_isolation_feasibility.py`。テスト名と期待値：
   - `test_safe_scope_rejects_shell_metacharacters`：不正scopeで実行コマンド0件、`BLOCKED`。
-  - `test_command_result_fields_and_rejects_unapproved_argv`：`CommandResult`の6フィールドと固定argv構文。不許可パス・shell・引数変更は実行0件で`BLOCKED`。
+  - `test_command_result_fields_and_rejects_unapproved_argv`：`CommandResult`の6フィールドと固定argv構文。Host IPv4 routeは`/usr/sbin/ip -j -4 route show table all`だけ許可し、`table all`省略・不許可パス・shell・引数変更は実行0件で`BLOCKED`。
   - `test_command_timeout_nonzero_and_output_limit_block`：timeout/非0/4096 bytes超過は`BLOCKED`、Owned Cleanup継続。
-  - `test_namespace_create_failure`：Namespace生成拒否で`BLOCKED`、作成済みOwnedだけCleanup、Host route変更0回。
-  - `test_preexisting_name_collision_never_deleted`：衝突した既存Namespace/Link/Tableの削除コマンド0件、`BLOCKED`。
-  - `test_ambiguous_creation_not_deleted`：作成の成否不明では未確認の実体を消さず、readback残留は`CLEANUP_FAILED`。
+  - `test_namespace_create_failure`：事前不存在確認済みNamespaceの生成拒否・生成後不存在確定で`BLOCKED`、作成済みOwnedだけCleanup、Host route変更0回。
+  - `test_planned_ns_add_allowed_before_ownership`：不存在確認済み名前が`planned_ns`にある段階では`ip netns add`を許可するが、`owned_ns`へは追加しない。
+  - `test_netns_del_requires_confirmed_owned_ns`：`ip netns del`は作成exit 0・所属readback後の`owned_ns`のみ許可し、`planned_ns`と既存・所有不明NamespaceへのdeleteはOS実行0件。
+  - `test_preexisting_name_collision_never_deleted`：衝突した既存Namespace/Link/Tableを`planned_ns`へ登録せず、削除コマンド0件、`BLOCKED`。
+  - `test_ambiguous_creation_not_deleted`：Namespaceの作成タイムアウト・非0で所有未確定なら`owned_ns`へ移さずdelete 0件。不存在確認ができないか残留すれば`CLEANUP_FAILED`。
   - `test_tun_missing_or_creation_denied`：`/dev/net/tun`欠落またはTUN作成拒否で`BLOCKED`、Owned Cleanup実施。
   - `test_nft_rule_definition_and_counter_delta_one`：`inet vof_<nonce> out`のhook/output/priority/policy/`counter drop`が一致し、送信側UDP/9 1件でcounter差分が正確に1、bytes増加、専用veth routeを確認して初めてDROP=`PASS`。
   - `test_nft_drop_counter_not_incremented`：counter差分0、読み取れないcounter、drop文言不足、宛先route不一致、送信失敗のいずれも`BLOCKED`。
-  - `test_cleanup_failure_overrides_capability_pass`：一部Cleanup失敗後も他のOwnedを処理、Host route/`ip_forward`差分または残留があれば`CLEANUP_FAILED`。
+  - `test_host_ipv4_route_snapshot_all_tables`：初期Snapshot・Cleanup後独立readbackの双方で`/usr/sbin/ip -j -4 route show table all`を呼び、main以外のtableを含めJSONを検証して同じ全経路集合を比較する。
+  - `test_host_ipv4_route_initial_failure_blocks`：初期route取得不能・非0・JSON不正・比較前処理不能は`BLOCKED`で、Kernel操作を開始しない。
+  - `test_cleanup_route_readback_failure_is_cleanup_failed`：Cleanup後のroute取得不能・JSON不正・比較不能・main以外のtable差分はいずれも`CLEANUP_FAILED`。
+  - `test_cleanup_failure_overrides_capability_pass`：一部Cleanup失敗後も他のOwnedを処理、全table route/`ip_forward`差分または残留があれば`CLEANUP_FAILED`。
   - `test_no_vpn_or_external_network_command`：OpenVPN、curl、GET、外部宛通信、Host route/`ip_forward`やHost Firewall変更のargvが一件もない。
-  - `test_success_requires_cleanup_and_route_unchanged`：全readback通過、Host IPv4 route全体/`ip_forward`不変、全Namespace/Link/Table不在なら`KERNEL_CAPABILITY_PASS`。
+  - `test_success_requires_cleanup_and_route_unchanged`：前後の`ip -j -4 route show table all`のJSON正常取得と全table前後一致、`ip_forward`不変、全Owned Namespace/Link/Table不在の独立readbackを満たす場合だけ`KERNEL_CAPABILITY_PASS`。
   - `test_main_redacts_errors_and_uses_fixed_schema`：例外や環境値をログに露出せず、固定JSON3キーのみ出力。
 - [ ] **Step 2: Run tests expecting RED**: `python3 -m unittest tests.test_gha_isolation_feasibility -v`。期待：未実装の公開インターフェースに関するFAIL/ERROR。
 - [ ] **Step 3: Implement minimal smoke**：以下の順序を守る。
-  1. root、固定絶対パスの`ip`/`nft`/Python、`/dev/net/tun`、Kernel version、Host IPv4 route**全体**と`ip_forward`をread-only snapshot。コマンドallowlistと`CommandResult`で失敗を判定。
-  2. nonceを生成し2つのNamespace名・専用veth/表名の不存在をreadback。衝突なら停止（既存の削除なし）。`ip netns add <tx>`、`ip netns add <rx>`、**tx Namespace内**でvethを作り片側をrxへ移動。作成後の状態とpeer対応をreadbackした対象だけOwnedに記録。
+  1. root、固定絶対パスの`ip`/`nft`/Python、`/dev/net/tun`、Kernel versionを確認。Host IPv4 route**全体**を`/usr/sbin/ip -j -4 route show table all`で初期snapshotし、`ip_forward`もread-only取得。exit 0・有効なJSON・前後比較可能な構造を検証し、初期取得不能・JSON不正なら`BLOCKED`としてKernel変更前に停止。
+  2. nonceを生成し2つのNamespace名・専用veth/表名の不存在をreadback。衝突した名前は登録・変更せず`BLOCKED`。不存在確認済みの`tx`/`rx`だけを`planned_ns`に登録し、`ip netns add <planned_ns>`を個別実行。各addのexit 0と直後readbackで所属・存在を確かめた名前だけ`owned_ns`へ遷移。失敗・成否不明の名前は未所有として削除せず、残留／不存在不明なら`CLEANUP_FAILED`。所有確定済みNamespaceだけでvethを作り片側をrxへ移動。vethも作成exit 0とpeer対応readbackでOwned確定。
   3. 専用`198.18.0.1/30`（tx）と`198.18.0.2/30`（rx）を各vethに割り当てup。Namespaceにdefault routeなし。HostへInterface/IP/route/firewallを追加せず、Hostのrouting/ip_forwardを変更しない。
   4. tx Namespace内の`voftun0` TUNを作り、readback。OpenVPNは起動しない。
   5. tx Namespaceの`inet vof_<nonce> out` chainを`filter/output/priority 0/policy accept`で作成、宛先rx `198.18.0.2`/UDP9への`counter drop`のみを登録。ルールの構造とbefore.packets=0をJSON readbackし、rx宛routeがtx vethであることを確認。tx Namespace内から固定3 bytesのUDP1回だけ送信した後、同じruleのafter.packets−before.packets=1かつbytes増加を確認。測定不能・不一致は`BLOCKED`。
-  6. 正常・部分失敗ともfinallyで**Owned確認済み**のnft/TUN/veth/Namespaceを逆順Cleanup。他者または所有不明の実体は削除しない。失敗しても後続Owned Cleanup継続。最後に別のreadbackで残留不在、Host route全体と`ip_forward`の完全一致を確認。残留・不変性未確認・cleanup失敗なら`CLEANUP_FAILED`が優先。
+  6. 正常・部分失敗ともfinallyで**Owned確認済み**のnft/TUN/veth/Namespaceを逆順Cleanup。`netns del`は`owned_ns`のみ、他者・`planned_ns`のままの名前・所有不明実体は削除しない。失敗しても後続Owned Cleanup継続。最後にHost初期snapshotと**同じ`/usr/sbin/ip -j -4 route show table all`**で独立readbackし、全tableのJSON正常性・比較可能性・前後一致、`ip_forward`不変、許可済みリソース不在を確認。route取得・JSON・比較の失敗、残留・不変性未確認・cleanup失敗なら`CLEANUP_FAILED`が優先。
   7. `CommandRunner`は各コマンド5秒以内、単発Smoke90秒以内、外部通信なし。異常終了の生例外・stderrを出力せず固定Reason CodeとChecksだけ出す。`KERNEL_CAPABILITY_PASS`は独立readbackを含む全条件PASS時のみ。
 - [ ] **Step 4: Run GREEN**：`python3 -m unittest tests.test_gha_isolation_feasibility -v`、`python3 -m compileall -q vpn_orbit tests`、`git diff --check`。すべて成功でTask 1の実装準備完了。これは**実RunnerのPASSではない**。
 - [ ] **Step 5: Commit only after separate Owner authorization**。コード変更は専用feature branchで管理し、既存`master`を直接変更しない。承認されるまでCommit/Pushしない。
